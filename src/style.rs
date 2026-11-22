@@ -1,7 +1,9 @@
-//! Unified Agente Code Desktop color tokens for the native `wgpu` interface.
+//! Exact Agente Code Desktop (`app.css`) monochrome-first design tokens for native `wgpu`.
 //!
-//! Dark theme: `#181818` sidebar, `#1c1c1c` graphite canvas, `#232323` composer/cards,
-//! `rgba(255,255,255,0.08)` subtle ring, `#e8793a` single brand orange accent.
+//! Dark theme: `#1c1c1c` canvas, `#212121` chrome sidebar, `#232323` cards,
+//! `#252527` composer sheet, `#272727` floating popovers/menus, `#ffffff` primary CTA
+//! with `#000000` ink, `#ffffff14` hairline seams, and `#e8793a` brand orange reserved
+//! strictly for live status/recording moments.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -78,16 +80,23 @@ pub struct Palette {
     pub bg_sidebar: Rgba,
     pub bg: Rgba,
     pub bg_panel: Rgba,
+    pub bg_composer: Rgba,
+    pub bg_popover: Rgba,
     pub bg_element: Rgba,
     pub bg_hover: Rgba,
     pub bg_active: Rgba,
+    pub segment_active: Rgba,
     pub seam: Rgba,
     pub ring: Rgba,
+    pub ring_focus: Rgba,
     pub backdrop: Rgba,
     pub fg: Rgba,
     pub fg_prose: Rgba,
     pub fg_muted: Rgba,
     pub fg_dim: Rgba,
+    pub primary: Rgba,
+    pub primary_fg: Rgba,
+    pub primary_hover: Rgba,
     pub accent: Rgba,
     pub accent_soft: Rgba,
     pub success: Rgba,
@@ -98,44 +107,58 @@ pub struct Palette {
 pub fn palette() -> Palette {
     match current_theme() {
         Theme::Dark => Palette {
-            bg_sidebar: Rgba::rgb(23, 23, 23),     // #171717 (sits a step behind canvas)
-            bg: Rgba::rgb(28, 28, 28),             // #1c1c1c
-            bg_panel: Rgba::rgb(35, 35, 35),       // #232323
-            bg_element: Rgba::rgb(44, 44, 44),     // #2c2c2c
-            bg_hover: Rgba::rgb(52, 52, 52),       // #343434
-            bg_active: Rgba::rgb(58, 58, 58),      // #3a3a3a
-            seam: Rgba::rgba(255, 255, 255, 16),   // 6% divider seam
-            ring: Rgba::rgba(255, 255, 255, 22),   // 8.5% composer ring
-            backdrop: Rgba::rgba(10, 10, 10, 185), // modal backdrop
-            fg: Rgba::rgb(250, 250, 250),          // #fafafa
-            fg_prose: Rgba::rgb(230, 230, 230),    // #e6e6e6
-            fg_muted: Rgba::rgb(174, 174, 174),    // #aeaeae
-            fg_dim: Rgba::rgb(126, 126, 126),      // #7e7e7e
-            accent: Rgba::rgb(232, 121, 58),       // #e8793a
-            accent_soft: Rgba::rgba(232, 121, 58, 36),
-            success: Rgba::rgb(108, 197, 138),     // #6cc58a
-            warning: Rgba::rgb(229, 180, 84),      // #e5b454
-            error: Rgba::rgb(240, 123, 114),       // #f07b72
+            bg_sidebar: Rgba::rgb(33, 33, 33),       // #212121 (--sidebar)
+            bg: Rgba::rgb(28, 28, 28),               // #1c1c1c (--background)
+            bg_panel: Rgba::rgb(35, 35, 35),         // #232323 (--card)
+            bg_composer: Rgba::rgb(37, 37, 39),      // #252527 (--composer-surface)
+            bg_popover: Rgba::rgb(39, 39, 39),       // #272727 (--popover)
+            bg_element: Rgba::rgb(43, 43, 43),       // #2b2b2b (--muted / --user-bubble)
+            bg_hover: Rgba::rgb(47, 47, 47),         // #2f2f2f (--surface-hover)
+            bg_active: Rgba::rgb(54, 54, 54),        // #363636 (pressed / active fill)
+            segment_active: Rgba::rgba(255, 255, 255, 34), // rgba(255,255,255,0.14) (--segment-active-bg)
+            seam: Rgba::rgba(255, 255, 255, 20),     // #ffffff14 (--border)
+            ring: Rgba::rgba(255, 255, 255, 26),     // rgba(255,255,255,0.10) (--composer-ring)
+            ring_focus: Rgba::rgba(255, 255, 255, 62), // rgba(255,255,255,0.24) (--composer-ring-focus)
+            backdrop: Rgba::rgba(0, 0, 0, 154),      // rgba(0,0,0,0.6) (--overlay)
+            fg: Rgba::rgb(250, 250, 250),            // #fafafa (--foreground)
+            fg_prose: Rgba::rgb(219, 219, 219),      // ~86% fg on #1c1c1c (--prose-ink)
+            fg_muted: Rgba::rgb(179, 179, 179),      // #b3b3b3 (--muted-foreground)
+            fg_dim: Rgba::rgb(132, 132, 132),        // #848484 (subtle caption/placeholder)
+            primary: Rgba::rgb(255, 255, 255),       // #ffffff (--primary)
+            primary_fg: Rgba::rgb(0, 0, 0),          // #000000 (--primary-foreground)
+            primary_hover: Rgba::rgb(232, 232, 232), // #e8e8e8
+            accent: Rgba::rgb(232, 121, 58),         // #e8793a (--brand-accent)
+            accent_soft: Rgba::rgba(232, 121, 58, 34),
+            success: Rgba::rgb(108, 197, 138),       // #6cc58a (--success)
+            warning: Rgba::rgb(229, 180, 84),        // #e5b454 (--warning)
+            error: Rgba::rgb(240, 123, 114),         // #f07b72 (--destructive)
         },
         Theme::Light => Palette {
-            bg_sidebar: Rgba::rgb(241, 240, 236),  // #f1f0ec
-            bg: Rgba::rgb(248, 247, 244),          // #f8f7f4
-            bg_panel: Rgba::rgb(255, 255, 255),    // #ffffff
-            bg_element: Rgba::rgb(236, 235, 230),  // #ecebe6
-            bg_hover: Rgba::rgb(227, 226, 220),    // #e3e2dc
-            bg_active: Rgba::rgb(220, 219, 212),   // #dcdbd4
-            seam: Rgba::rgba(0, 0, 0, 18),
-            ring: Rgba::rgba(0, 0, 0, 26),
-            backdrop: Rgba::rgba(20, 20, 20, 120),
-            fg: Rgba::rgb(23, 23, 23),             // #171717
-            fg_prose: Rgba::rgb(38, 38, 38),       // #262626
-            fg_muted: Rgba::rgb(92, 92, 92),       // #5c5c5c
-            fg_dim: Rgba::rgb(138, 138, 138),      // #8a8a8a
-            accent: Rgba::rgb(214, 98, 34),        // #d66222
-            accent_soft: Rgba::rgba(214, 98, 34, 28),
-            success: Rgba::rgb(28, 140, 74),       // #1c8c4a
-            warning: Rgba::rgb(184, 126, 16),      // #b87e10
-            error: Rgba::rgb(204, 52, 44),         // #cc342c
+            bg_sidebar: Rgba::rgb(255, 255, 255),    // #ffffff (--sidebar)
+            bg: Rgba::rgb(250, 250, 250),            // #fafafa (--card / light canvas)
+            bg_panel: Rgba::rgb(255, 255, 255),      // #ffffff (--popover)
+            bg_composer: Rgba::rgb(255, 255, 255),   // #ffffff (--composer-surface)
+            bg_popover: Rgba::rgb(255, 255, 255),    // #ffffff (--popover)
+            bg_element: Rgba::rgb(243, 243, 244),    // #f3f3f4 (--user-bubble)
+            bg_hover: Rgba::rgb(240, 240, 240),      // #f0f0f0
+            bg_active: Rgba::rgb(232, 232, 232),     // #e8e8e8 (--accent-hover)
+            segment_active: Rgba::rgb(255, 255, 255), // #ffffff (--segment-active-bg)
+            seam: Rgba::rgba(0, 0, 0, 20),           // rgba(0,0,0,0.08) (--border)
+            ring: Rgba::rgba(0, 0, 0, 24),           // rgba(0,0,0,0.09) (--composer-ring)
+            ring_focus: Rgba::rgba(0, 0, 0, 68),     // rgba(0,0,0,0.26) (--composer-ring-focus)
+            backdrop: Rgba::rgba(0, 0, 0, 90),       // rgba(0,0,0,0.35) (--overlay)
+            fg: Rgba::rgb(0, 0, 0),                  // #000000 (--foreground)
+            fg_prose: Rgba::rgb(23, 23, 23),         // #171717
+            fg_muted: Rgba::rgb(82, 82, 82),         // #525252 (--muted-foreground)
+            fg_dim: Rgba::rgb(115, 115, 115),        // #737373
+            primary: Rgba::rgb(0, 0, 0),             // #000000 (--primary)
+            primary_fg: Rgba::rgb(255, 255, 255),    // #ffffff (--primary-foreground)
+            primary_hover: Rgba::rgb(23, 23, 23),    // #171717 (--primary-hover)
+            accent: Rgba::rgb(231, 109, 31),         // #e76d1f (--brand-accent)
+            accent_soft: Rgba::rgba(231, 109, 31, 26),
+            success: Rgba::rgb(22, 163, 74),         // #16a34a (--success)
+            warning: Rgba::rgb(202, 138, 4),         // #ca8a04 (--warning)
+            error: Rgba::rgb(220, 38, 38),           // #dc2626 (--error)
         },
     }
 }

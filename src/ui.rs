@@ -375,12 +375,12 @@ fn draw_chip(
     let ht = if hovered { hover_t } else { 0.0 };
 
     let base_fill = if active {
-        pal.accent_soft
+        pal.segment_active
     } else {
         pal.bg_hover.with_alpha(0)
     };
     let hover_fill = if active {
-        pal.accent
+        pal.bg_active
     } else if is_pressed {
         pal.bg_active
     } else {
@@ -388,21 +388,25 @@ fn draw_chip(
     };
     let fill = base_fill.lerp(hover_fill, ht);
 
-    let base_fg = if active { pal.accent } else { pal.fg_muted };
-    let hover_fg = if active {
-        Rgba::rgb(255, 255, 255)
-    } else {
-        pal.fg
-    };
+    let base_fg = if active { pal.fg } else { pal.fg_muted };
+    let hover_fg = pal.fg;
     let fg = base_fg.lerp(hover_fg, ht);
 
     if fill.0[3] > 0 {
-        let ring = if hovered && !active {
-            pal.ring.with_alpha((f32::from(pal.ring.0[3]) * ht) as u8)
+        let ring = if active {
+            pal.ring
+        } else if hovered {
+            pal.seam.with_alpha((f32::from(pal.seam.0[3]) * ht) as u8)
         } else {
             Rgba::transparent()
         };
-        dl.fill_rect_bordered(rect, height * 0.5, fill, if hovered { 1.0 } else { 0.0 }, ring);
+        dl.fill_rect_bordered(
+            rect,
+            8.0,
+            fill,
+            if active || hovered { 1.0 } else { 0.0 },
+            ring,
+        );
     }
     dl.draw_text_centered(te, rect, 12.5, fg, weight, label);
     hits.push(HitZone {
@@ -446,7 +450,7 @@ fn draw_tooltip(
         py = (anchor.y + anchor.h + 6.0).min((win_h - ph - 6.0).max(6.0));
     }
     let rect = Rect::new(px, py, pw, ph);
-    dl.fill_rect_bordered(rect, 7.0, pal.bg_element, 1.0, pal.ring);
+    dl.fill_rect_bordered(rect, 6.0, pal.bg_popover, 1.0, pal.ring);
     dl.draw_text_centered(te, rect, 11.5, pal.fg, FontWeight::Semibold, text);
 }
 
@@ -479,19 +483,20 @@ fn draw_modal_button(
     let ht = if hovered { hover_t } else { 0.0 };
 
     let (base_fill, hover_fill, base_fg, hover_fg, border) = match tone {
+        // High-contrast monochrome primary CTA (solid white + black text in dark, black + white in light)
         ModalBtnTone::Primary => (
-            pal.accent_soft,
-            pal.accent,
-            pal.accent,
-            Rgba::rgb(255, 255, 255),
-            pal.accent,
+            pal.primary,
+            pal.primary_hover,
+            pal.primary_fg,
+            pal.primary_fg,
+            pal.primary,
         ),
         ModalBtnTone::Danger => (
-            pal.error.with_alpha(38),
+            pal.error.with_alpha(34),
             pal.error,
             pal.error,
-            Rgba::rgb(255, 255, 255),
-            pal.error,
+            Rgba::rgb(26, 26, 26),
+            pal.error.with_alpha(90),
         ),
         ModalBtnTone::Secondary => (
             pal.bg_element,
@@ -503,7 +508,7 @@ fn draw_modal_button(
     };
     let fill = base_fill.lerp(hover_fill, ht);
     let fg = base_fg.lerp(hover_fg, ht);
-    dl.fill_rect_bordered(rect, 8.0, fill, 1.0, border);
+    dl.fill_rect_bordered(rect, 6.0, fill, 1.0, border);
     dl.draw_text_centered(te, rect, 12.5, fg, weight, label);
     hits.push(HitZone {
         rect: Rect::new(x, y, w, height),
@@ -532,15 +537,50 @@ pub fn render_main_window(
     let sidebar_w = 224.0_f32.min(w * 0.30);
     let titlebar_h = 38.0;
 
-    // ── 1. Layered Surfaces: Sidebar + Main Canvas ───────────────────────────
+    // ── 1. Layered Surfaces: Sidebar + Main Canvas + Top Chrome Hairline ────
     dl.fill_rect(Rect::new(0.0, 0.0, sidebar_w, h), 0.0, pal.bg_sidebar);
     dl.fill_rect(Rect::new(sidebar_w, 0.0, 1.0, h), 0.0, pal.seam);
+    dl.fill_rect(
+        Rect::new(sidebar_w + 1.0, titlebar_h, w - sidebar_w - 1.0, 1.0),
+        0.0,
+        pal.seam,
+    );
 
     // Draggable custom title bar across the top
     hits.push(HitZone {
-        rect: Rect::new(0.0, 0.0, w - 126.0, titlebar_h),
+        rect: Rect::new(0.0, 0.0, w - 164.0, titlebar_h),
         target: HitTarget::DragWindow,
     });
+
+    // Quick theme toggle icon right next to window controls (matching Agente Code top-right chrome)
+    {
+        let is_dark = current_theme() == Theme::Dark;
+        let trect = Rect::new(w - 162.0, 5.0, 28.0, 28.0);
+        let thov = trect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
+        if thov {
+            dl.fill_rect(trect, 6.0, pal.bg_hover);
+            tooltip = Some((
+                trect,
+                if is_dark {
+                    "Switch to Light theme"
+                } else {
+                    "Switch to Dark theme"
+                },
+            ));
+        }
+        draw_centered_icon(
+            dl,
+            te,
+            if is_dark { IconId::Sun } else { IconId::Moon },
+            trect,
+            14.0,
+            if thov { pal.fg } else { pal.fg_dim },
+        );
+        hits.push(HitZone {
+            rect: trect,
+            target: HitTarget::ToggleTheme,
+        });
+    }
 
     // Window controls (Electron SVG icons: minus, maximize-2, x) on top-right
     let win_btns = [
@@ -596,47 +636,35 @@ pub fn render_main_window(
     let nav_items = [
         (AppView::Dictate, IconId::Mic, "Dictate"),
         (AppView::Models, IconId::Cpu, "Models"),
-        (AppView::Settings, IconId::Settings, "Settings"),
     ];
     for (i, (v, icon, label)) in nav_items.into_iter().enumerate() {
-        let ny = 60.0 + i as f32 * 36.0;
-        let nrect = Rect::new(12.0, ny, sidebar_w - 24.0, 32.0);
+        let ny = 56.0 + i as f32 * 34.0;
+        let nrect = Rect::new(10.0, ny, sidebar_w - 20.0, 32.0);
         let active = snap.view == v;
         let hov = nrect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
-        if active || hov {
-            dl.fill_rect(
-                nrect,
-                8.0,
-                if active { pal.bg_element } else { pal.bg_hover },
-            );
-        }
         if active {
-            dl.fill_rect(Rect::new(16.0, ny + 8.0, 3.0, 16.0), 1.5, pal.accent);
+            dl.fill_rect_bordered(nrect, 8.0, pal.bg_element, 1.0, pal.seam);
+        } else if hov {
+            dl.fill_rect(nrect, 8.0, pal.bg_hover);
         }
         dl.draw_icon(
             te,
             icon,
-            26.0,
+            22.0,
             ny + 8.5,
             15.0,
-            if active {
-                pal.accent
-            } else if hov {
-                pal.fg
-            } else {
-                pal.fg_muted
-            },
+            if active || hov { pal.fg } else { pal.fg_muted },
         );
         dl.draw_text_vcentered(
             te,
-            48.0,
+            45.0,
             ny + 16.0,
             13.5,
             if active || hov { pal.fg } else { pal.fg_muted },
             if active {
-                FontWeight::Bold
-            } else {
                 FontWeight::Semibold
+            } else {
+                FontWeight::Regular
             },
             None,
             label,
@@ -650,32 +678,30 @@ pub fn render_main_window(
     // Sidebar: Installed Local Models quick-switcher
     let installed_ids = installed_local_models(snap.paths);
     if !installed_ids.is_empty() {
-        let sec_y = 186.0;
+        let sec_y = 140.0;
         dl.draw_text(
             te,
-            22.0,
+            20.0,
             sec_y,
             11.0,
             pal.fg_dim,
-            FontWeight::Bold,
+            FontWeight::Semibold,
             None,
             1,
-            "INSTALLED MODELS",
+            "Installed Models",
         );
         for (idx, mid) in installed_ids.iter().take(6).enumerate() {
             let my = sec_y + 22.0 + idx as f32 * 28.0;
-            if my + 26.0 > h - 90.0 {
+            if my + 26.0 > h - 130.0 {
                 break;
             }
-            let mrect = Rect::new(12.0, my, sidebar_w - 24.0, 26.0);
+            let mrect = Rect::new(10.0, my, sidebar_w - 20.0, 26.0);
             let is_cur = snap.config.backend == "local" && &snap.config.local_model == mid;
             let hov = mrect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
-            if is_cur || hov {
-                dl.fill_rect(
-                    mrect,
-                    6.0,
-                    if is_cur { pal.bg_element } else { pal.bg_hover },
-                );
+            if is_cur {
+                dl.fill_rect_bordered(mrect, 7.0, pal.bg_element, 1.0, pal.seam);
+            } else if hov {
+                dl.fill_rect(mrect, 7.0, pal.bg_hover);
             }
             dl.fill_circle(
                 mrect.x + 12.0,
@@ -687,12 +713,12 @@ pub fn render_main_window(
                 te,
                 mrect.x + 22.0,
                 mrect.y + 13.0,
-                12.0,
+                12.5,
                 if is_cur || hov { pal.fg } else { pal.fg_muted },
                 if is_cur {
-                    FontWeight::Bold
-                } else {
                     FontWeight::Semibold
+                } else {
+                    FontWeight::Regular
                 },
                 Some(mrect.w - 28.0),
                 mid,
@@ -702,6 +728,45 @@ pub fn render_main_window(
                 target: HitTarget::ActivateLocalModel(mid.clone()),
             });
         }
+    }
+
+    // Settings pinned at bottom of left rail (matching Agente Code sidebar layout)
+    {
+        let sy = h - 114.0;
+        let srect = Rect::new(10.0, sy, sidebar_w - 20.0, 32.0);
+        let active = snap.view == AppView::Settings;
+        let hov = srect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
+        if active {
+            dl.fill_rect_bordered(srect, 8.0, pal.bg_element, 1.0, pal.seam);
+        } else if hov {
+            dl.fill_rect(srect, 8.0, pal.bg_hover);
+        }
+        dl.draw_icon(
+            te,
+            IconId::Settings,
+            22.0,
+            sy + 8.5,
+            15.0,
+            if active || hov { pal.fg } else { pal.fg_muted },
+        );
+        dl.draw_text_vcentered(
+            te,
+            45.0,
+            sy + 16.0,
+            13.5,
+            if active || hov { pal.fg } else { pal.fg_muted },
+            if active {
+                FontWeight::Semibold
+            } else {
+                FontWeight::Regular
+            },
+            None,
+            "Settings",
+        );
+        hits.push(HitZone {
+            rect: srect,
+            target: HitTarget::SwitchView(AppView::Settings),
+        });
     }
 
     // Sidebar bottom status footer (scannable, quiet)
@@ -855,14 +920,14 @@ fn render_dictate_view(
     let col_x = area.x + (area.w - col_w) * 0.5;
     let is_rec = matches!(snap.phase, DictationPhase::Recording);
 
-    // ── 28px-Radius Agente Composer Pill ─────────────────────────────────────
-    let pill_y = area.y + 18.0;
-    let pill_h = 132.0;
+    // ── Agente Code Composer Sheet (--composer-radius: 12px, #252527, 1px ring) ─
+    let pill_y = area.y + 20.0;
+    let pill_h = 130.0;
     let pill = Rect::new(col_x, pill_y, col_w, pill_h);
     dl.fill_rect_bordered(
         pill,
-        28.0,
-        pal.bg_panel,
+        12.0,
+        pal.bg_composer,
         1.0,
         if is_rec { pal.accent } else { pal.ring },
     );
@@ -1037,9 +1102,9 @@ fn render_dictate_view(
         );
     }
 
-    // 34px round Mic / Stop button on the hard right (with smooth hover lift & press depth)
-    let btn_r = 17.0;
-    let btn_cx = pill.x + pill.w - 30.0;
+    // 34px round Mic / Stop button on the hard right (monochrome white CTA when idle, orange when recording)
+    let btn_r = 16.0;
+    let btn_cx = pill.x + pill.w - 28.0;
     let mic_pressed = snap.pressed_target == Some(&HitTarget::ToggleRecord);
     let btn_cy = bar_y + 15.0 + if mic_pressed { 1.0 } else { 0.0 };
     let btn_rect = Rect::new(btn_cx - btn_r, btn_cy - btn_r, btn_r * 2.0, btn_r * 2.0);
@@ -1050,23 +1115,13 @@ fn render_dictate_view(
     } else if mic_pressed {
         pal.bg_active
     } else {
-        pal.bg_element.lerp(pal.bg_active, ht)
+        pal.primary.lerp(pal.primary_hover, ht)
     };
-    if btn_hov && !is_rec {
-        dl.fill_circle(btn_cx, btn_cy, btn_r + 2.0, pal.accent_soft.with_alpha((32.0 * ht) as u8));
-    }
     dl.fill_circle(btn_cx, btn_cy, btn_r, btn_fill);
     if is_rec {
-        draw_centered_icon(dl, te, IconId::Square, btn_rect, 14.0, Rgba::rgb(255, 255, 255));
+        draw_centered_icon(dl, te, IconId::Square, btn_rect, 13.0, Rgba::rgb(255, 255, 255));
     } else {
-        draw_centered_icon(
-            dl,
-            te,
-            IconId::Mic,
-            btn_rect,
-            16.0,
-            if btn_hov { pal.accent } else { pal.fg },
-        );
+        draw_centered_icon(dl, te, IconId::Mic, btn_rect, 15.0, pal.primary_fg);
     }
     if btn_hov && !snap.model_dropdown_open {
         *tooltip = Some((
@@ -1148,17 +1203,10 @@ fn render_dictate_view(
             let is_sel = idx == snap.selected_history;
             let is_hov = rrect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
 
-            if is_sel || is_hov {
-                dl.fill_rect(
-                    rrect,
-                    10.0,
-                    if is_sel { pal.bg_panel } else { pal.bg_panel.with_alpha(150) },
-                );
-                dl.fill_rect(
-                    Rect::new(rrect.x + 2.0, rrect.y + 10.0, 2.5, row_h - 20.0),
-                    1.25,
-                    pal.accent,
-                );
+            if is_sel {
+                dl.fill_rect_bordered(rrect, 8.0, pal.bg_panel, 1.0, pal.seam);
+            } else if is_hov {
+                dl.fill_rect(rrect, 8.0, pal.bg_panel.with_alpha(150));
             }
             hits.push(HitZone {
                 rect: rrect,
@@ -1319,7 +1367,7 @@ fn render_model_dropdown(
     let dh = dh.min(max_h);
 
     let drect = Rect::new(dx, anchor_y, dw, dh);
-    dl.fill_rect_bordered(drect, 12.0, pal.bg_panel, 1.0, pal.ring);
+    dl.fill_rect_bordered(drect, 12.0, pal.bg_popover, 1.0, pal.ring);
 
     let mut y = drect.y + 8.0;
     if !installed.is_empty() {
@@ -1509,39 +1557,39 @@ fn render_models_view(
         "On-device Non-Whisper (Qwen3-ASR, Parakeet, SenseVoice, Moonshine), Whisper GGML, Hugging Face, and 15 Commercial STT APIs.",
     );
 
-    // Interactive Search bar with focus ring, hover lift, blinking caret, and Clear (×) button
-    let search_rect = Rect::new(col_x, area.y + 68.0, col_w, 36.0);
+    // Interactive Search bar (--radius-input: 6px, monochrome focus ring)
+    let search_rect = Rect::new(col_x, area.y + 68.0, col_w, 34.0);
     let search_hov = search_rect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
     let search_focused = snap.model_search_focused;
     let search_fill = if search_focused {
-        pal.bg_element
+        pal.bg_composer
     } else if search_hov {
-        pal.bg_panel.lerp(pal.bg_element, snap.hover_t)
+        pal.bg_panel.lerp(pal.bg_composer, snap.hover_t)
     } else {
         pal.bg_panel
     };
     let search_border = if search_focused {
-        pal.accent
+        pal.ring_focus
     } else if search_hov {
-        pal.fg_dim
-    } else {
         pal.ring
+    } else {
+        pal.seam
     };
     dl.fill_rect_bordered(
         search_rect,
-        9.0,
+        6.0,
         search_fill,
-        if search_focused { 1.5 } else { 1.0 },
+        1.0,
         search_border,
     );
     dl.draw_icon(
         te,
         IconId::Search,
-        search_rect.x + 12.0,
-        search_rect.y + 10.5,
+        search_rect.x + 11.0,
+        search_rect.y + 9.5,
         15.0,
         if search_focused {
-            pal.accent
+            pal.fg
         } else if search_hov {
             pal.fg_muted
         } else {
@@ -1549,7 +1597,7 @@ fn render_models_view(
         },
     );
 
-    let text_x = search_rect.x + 35.0;
+    let text_x = search_rect.x + 34.0;
     let text_cy = search_rect.y + search_rect.h * 0.5;
     let has_filter = !snap.model_filter.is_empty();
     let max_text_w = search_rect.w - if has_filter { 72.0 } else { 48.0 };
@@ -1567,11 +1615,11 @@ fn render_models_view(
         );
         if search_focused && snap.caret_visible {
             let cx = (text_x + drawn_w + 1.5).min(text_x + max_text_w);
-            dl.fill_rect(Rect::new(cx, text_cy - 8.5, 1.5, 17.0), 0.75, pal.accent);
+            dl.fill_rect(Rect::new(cx, text_cy - 8.0, 1.5, 16.0), 0.75, pal.fg);
         }
     } else {
         if search_focused && snap.caret_visible {
-            dl.fill_rect(Rect::new(text_x, text_cy - 8.5, 1.5, 17.0), 0.75, pal.accent);
+            dl.fill_rect(Rect::new(text_x, text_cy - 8.0, 1.5, 16.0), 0.75, pal.fg);
         }
         dl.draw_text_vcentered(
             te,
@@ -1910,29 +1958,23 @@ fn render_settings_view(
         let hov = brect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
         let ht = if hov { snap.hover_t } else { 0.0 };
         let base_fill = if highlight {
-            pal.accent_soft
+            pal.segment_active
         } else {
             pal.bg_panel
         };
-        let hover_fill = if highlight {
-            pal.accent
-        } else if is_pressed {
+        let hover_fill = if is_pressed {
             pal.bg_active
         } else {
             pal.bg_hover
         };
         let fill = base_fill.lerp(hover_fill, ht);
-        let fg = if highlight {
-            pal.accent.lerp(Rgba::rgb(255, 255, 255), ht)
-        } else {
-            pal.fg
-        };
+        let fg = pal.fg;
         dl.fill_rect_bordered(
             brect,
-            8.0,
+            6.0,
             fill,
             1.0,
-            if highlight { pal.accent } else { pal.ring },
+            if highlight { pal.ring_focus } else { pal.ring },
         );
         dl.draw_text_centered(te, brect, 12.5, fg, bweight, val);
         hits.push(HitZone {
@@ -2075,26 +2117,24 @@ fn render_settings_view(
             let hov = prect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
             let ht = if hov { snap.hover_t } else { 0.0 };
             let fill = if is_cur {
-                pal.accent_soft.lerp(pal.accent, ht)
+                pal.segment_active.lerp(pal.bg_active, ht)
             } else {
                 pal.bg_panel.lerp(
                     if is_pressed { pal.bg_active } else { pal.bg_hover },
                     ht,
                 )
             };
-            let border = if is_cur { pal.accent } else { pal.ring };
-            dl.fill_rect_bordered(prect, 8.0, fill, 1.0, border);
-            let dot_col = if is_cur && hov {
-                Rgba::rgb(255, 255, 255)
+            let border = if is_cur { pal.ring_focus } else { pal.ring };
+            dl.fill_rect_bordered(prect, 6.0, fill, 1.0, border);
+            let dot_col = if is_cur {
+                pal.accent
             } else if ready {
                 pal.success
             } else {
                 pal.fg_dim.with_alpha(110)
             };
             dl.fill_circle(prect.x + 11.0, prect.y + prect.h * 0.5, 3.0, dot_col);
-            let fg = if is_cur {
-                pal.accent.lerp(Rgba::rgb(255, 255, 255), ht)
-            } else if hov || ready {
+            let fg = if is_cur || hov || ready {
                 pal.fg
             } else {
                 pal.fg_muted
@@ -2320,17 +2360,17 @@ fn draw_modal_input_field(
     let frect = Rect::new(x, y + 18.0, w, 34.0);
     let hov = frect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
     let border = if focused {
-        pal.accent
+        pal.ring_focus
     } else if hov {
-        pal.fg_dim
-    } else {
         pal.ring
+    } else {
+        pal.seam
     };
     dl.fill_rect_bordered(
         frect,
-        8.0,
-        pal.bg_element,
-        if focused { 1.5 } else { 1.0 },
+        6.0,
+        pal.bg_panel,
+        1.0,
         border,
     );
 
@@ -2357,7 +2397,7 @@ fn draw_modal_input_field(
 
     if display.is_empty() {
         if focused && snap.caret_visible {
-            dl.fill_rect(Rect::new(tx, cy - 8.0, 1.5, 16.0), 0.75, pal.accent);
+            dl.fill_rect(Rect::new(tx, cy - 8.0, 1.5, 16.0), 0.75, pal.fg);
         }
         dl.draw_text_vcentered(
             te,
@@ -2382,7 +2422,7 @@ fn draw_modal_input_field(
         );
         if focused && snap.caret_visible {
             let cx = (tx + drawn_w + 1.5).min(tx + max_tw);
-            dl.fill_rect(Rect::new(cx, cy - 8.0, 1.5, 16.0), 0.75, pal.accent);
+            dl.fill_rect(Rect::new(cx, cy - 8.0, 1.5, 16.0), 0.75, pal.fg);
         }
     }
 
@@ -2423,7 +2463,7 @@ fn render_provider_config_modal(
     let my = (snap.height - mh) * 0.5;
     let mrect = Rect::new(mx, my, mw, mh);
 
-    dl.fill_rect_bordered(mrect, 18.0, pal.bg_panel, 1.0, pal.ring);
+    dl.fill_rect_bordered(mrect, 12.0, pal.bg_popover, 1.0, pal.ring);
     // Catch clicks inside modal so they don't close it
     hits.push(HitZone {
         rect: mrect,
@@ -2636,7 +2676,7 @@ fn render_confirm_download_modal(
     let my = (snap.height - mh) * 0.5;
     let mrect = Rect::new(mx, my, mw, mh);
 
-    dl.fill_rect_bordered(mrect, 18.0, pal.bg_panel, 1.0, pal.ring);
+    dl.fill_rect_bordered(mrect, 12.0, pal.bg_popover, 1.0, pal.ring);
     dl.fill_circle(mx + 22.0, my + 26.0, 4.5, pal.accent);
     dl.draw_text_vcentered(
         te,
@@ -2727,7 +2767,7 @@ fn render_confirm_delete_modal(
     let my = (snap.height - mh) * 0.5;
     let mrect = Rect::new(mx, my, mw, mh);
 
-    dl.fill_rect_bordered(mrect, 18.0, pal.bg_panel, 1.0, pal.ring);
+    dl.fill_rect_bordered(mrect, 12.0, pal.bg_popover, 1.0, pal.ring);
     dl.fill_circle(mx + 22.0, my + 26.0, 4.5, pal.error);
     dl.draw_text_vcentered(
         te,
@@ -2810,7 +2850,7 @@ pub fn render_overlay_pill(
 
     let pill = Rect::new(0.0, 0.0, width, height);
     let radius = height * 0.5;
-    dl.fill_rect_bordered(pill, radius, pal.bg_panel, 1.5, ring);
+    dl.fill_rect_bordered(pill, radius, pal.bg_popover, 1.5, ring);
 
     let voice_energy: f32 = if is_rec {
         audio_levels.iter().copied().sum::<f32>() / audio_levels.len() as f32
