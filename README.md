@@ -49,8 +49,8 @@ Switch between local models, Hugging Face, commercial APIs, and self-hosted serv
 Requires a recent Rust toolchain (`rustup`).
 
 ```bash
-git clone https://github.com/fabricio3g/Enio.git
-cd Enio
+git clone https://github.com/fabricio3g/Zov.git
+cd Zov
 cargo run --release
 ```
 
