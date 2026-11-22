@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" fill="none">
+  <!-- Framed Monochrome App Icon (Dark) — GENIO Silhouette + Dictation Waveform -->
+  <defs>
+    <clipPath id="squircle">
+      <rect x="2" y="2" width="60" height="60" rx="14"/>
+    </clipPath>
+  </defs>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#111111"/>
+  <g clip-path="url(#squircle)" fill="#FFFFFF">
+    <!-- Right-anchored GENIO silhouette matching original meme framing -->
+    <path fill-rule="evenodd" d="
+      M 31.5 11
+      C 36.8 6.4 45 5.6 54 7.8
+      C 59.5 9.2 63 12.2 64 16
+      L 64 64
+      L 42 64
+      C 40.6 60 39.2 57 37.5 55.2
+      C 36 53.6 36.4 51.2 38.2 49.8
+      L 49.6 41.2
+      C 52.8 38.8 52 33.8 48 33.8
+      L 34.8 33.8
+      C 33 33.8 32.4 32 33.4 30.8
+      L 34.2 29.8
+      C 28.4 29.5 28 23.2 34 22
+      L 35.2 17.8
+      L 31.6 16.2
+      L 34.8 14.2
+      Z
+      M 39.8 18.2
+      A 2.9 4.1 0 1 0 39.8 26.4
+      A 2.9 4.1 0 1 0 39.8 18.2
+      Z
+    "/>
+    <!-- 3 bold dictation waveform bars optically balanced in the left negative space -->
+    <rect x="9.5"  y="36.5" width="4.6" height="12" rx="2.3"/>
+    <rect x="17.3" y="30.5" width="4.6" height="24" rx="2.3"/>
+    <rect x="25.1" y="35.0" width="4.6" height="15" rx="2.3"/>
+  </g>
+  <!-- Subtle edge highlight so the dark tile holds shape on pure black backgrounds -->
+  <rect x="2.5" y="2.5" width="59" height="59" rx="13.5" stroke="#FFFFFF" stroke-opacity="0.14" stroke-width="1"/>
+</svg>
