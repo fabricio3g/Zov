@@ -430,7 +430,7 @@ pub struct CommercialProviderSpec {
 pub const COMMERCIAL_STT_PROVIDERS: &[CommercialProviderSpec] = &[
     CommercialProviderSpec {
         id: "huggingface",
-        name: "Hugging Face Hub (Non-Whisper & Open ASR)",
+        name: "Hugging Face",
         protocol: CommercialSttProtocol::HuggingFaceInference,
         default_base_url: "https://router.huggingface.co/hf-inference/models",
         default_model: "Qwen/Qwen3-ASR-1.7B",
@@ -783,7 +783,7 @@ pub const COMMERCIAL_STT_PROVIDERS: &[CommercialProviderSpec] = &[
     },
     CommercialProviderSpec {
         id: "speechmatics",
-        name: "Speechmatics (Non-Whisper Ursa-2)",
+        name: "Speechmatics",
         protocol: CommercialSttProtocol::Speechmatics,
         default_base_url: "https://asr.api.speechmatics.com/v2",
         default_model: "enhanced",
@@ -803,7 +803,7 @@ pub const COMMERCIAL_STT_PROVIDERS: &[CommercialProviderSpec] = &[
     },
     CommercialProviderSpec {
         id: "revai",
-        name: "Rev AI (Non-Whisper Reverb)",
+        name: "Rev AI",
         protocol: CommercialSttProtocol::RevAi,
         default_base_url: "https://api.rev.ai/speechtotext/v1",
         default_model: "reverb",
@@ -828,7 +828,7 @@ pub const COMMERCIAL_STT_PROVIDERS: &[CommercialProviderSpec] = &[
     },
     CommercialProviderSpec {
         id: "custom",
-        name: "Self-Hosted / Local Server (vLLM / Speaches / Sherpa-ONNX)",
+        name: "Self-Hosted",
         protocol: CommercialSttProtocol::OpenAiMultipart,
         default_base_url: "http://127.0.0.1:8000/v1",
         default_model: "Qwen/Qwen3-ASR-1.7B",
@@ -836,32 +836,32 @@ pub const COMMERCIAL_STT_PROVIDERS: &[CommercialProviderSpec] = &[
         models: &[
             CommercialModelSpec {
                 id: "Qwen/Qwen3-ASR-1.7B",
-                label: "Alibaba Qwen3-ASR 1.7B (via vLLM / OpenAI Server)",
+                label: "Qwen3-ASR 1.7B (vLLM / OpenAI API)",
                 note: "Top non-Whisper multilingual ASR served locally",
             },
             CommercialModelSpec {
                 id: "nvidia/parakeet-tdt-0.6b-v3",
-                label: "NVIDIA Parakeet-TDT 0.6B v3 (via Speaches / ONNX Server)",
+                label: "Parakeet-TDT 0.6B v3 (Speaches / ONNX)",
                 note: "Blazing-fast Token-and-Duration Transducer local server model",
             },
             CommercialModelSpec {
                 id: "nvidia/canary-1b-v2",
-                label: "NVIDIA Canary 1B v2 (via Speaches / NeMo Server)",
+                label: "Canary 1B v2 (Speaches / NeMo)",
                 note: "Top open multilingual transcription & translation model",
             },
             CommercialModelSpec {
                 id: "FunAudioLLM/SenseVoiceSmall",
-                label: "Alibaba SenseVoiceSmall (via FunASR / Speaches Server)",
+                label: "SenseVoiceSmall (FunASR / Speaches)",
                 note: "Non-autoregressive ASR with emotion & event detection",
             },
             CommercialModelSpec {
                 id: "usefulsensors/moonshine-base",
-                label: "Moonshine Base (via Speaches / Edge Server)",
+                label: "Moonshine Base (Speaches / Edge)",
                 note: "Ultra-lightweight edge dictation model by Useful Sensors",
             },
             CommercialModelSpec {
                 id: "Qwen/Qwen2-Audio-7B-Instruct",
-                label: "Qwen2-Audio 7B (via vLLM / OpenAI Server)",
+                label: "Qwen2-Audio 7B (vLLM / OpenAI API)",
                 note: "Alibaba end-to-end multimodal audio-language model",
             },
         ],

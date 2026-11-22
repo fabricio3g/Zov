@@ -316,16 +316,32 @@ impl DictateConfig {
         false
     }
 
-    pub fn set_api_key(&mut self, provider_id: &str, key: String) {
-        let trimmed = key.trim().to_string();
+    pub fn set_provider_config(
+        &mut self,
+        provider_id: &str,
+        api_key: String,
+        base_url: String,
+        model: String,
+    ) {
+        let key = api_key.trim().to_string();
+        let url = base_url.trim().trim_end_matches('/').to_string();
+        let mdl = model.trim().to_string();
+
         if provider_id == "huggingface" {
-            self.hf_token = trimmed.clone();
+            self.hf_token = key.clone();
         }
         let entry = self
             .providers
             .entry(provider_id.to_string())
             .or_default();
-        entry.api_key = trimmed;
+        entry.api_key = key;
+        entry.base_url = url;
+        if !mdl.is_empty() {
+            entry.model = mdl.clone();
+            if self.backend == provider_id {
+                self.commercial_model = mdl;
+            }
+        }
     }
 
     pub fn active_summary(&self) -> String {

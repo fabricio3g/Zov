@@ -55,13 +55,35 @@ pub enum DictationPhase {
     Error(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderField {
+    BaseUrl,
+    ModelId,
+    ApiKey,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Modal {
     None,
-    ApiKeyInput {
+    ProviderConfig {
         provider_id: String,
         provider_name: String,
-        buffer: String,
+        is_self_hosted: bool,
+        base_url: String,
+        model_id: String,
+        api_key: String,
+        active_field: ProviderField,
+        reveal_key: bool,
+    },
+    ConfirmDownload {
+        model_id: String,
+        label: String,
+        size_mb: u32,
+        engine_name: String,
+    },
+    ConfirmDeleteClip {
+        index: usize,
+        preview: String,
     },
 }
 
@@ -79,6 +101,13 @@ pub enum HitTarget {
     CloseWindow,
     SwitchView(AppView),
     ToggleRecord,
+    ToggleModelDropdown,
+    CloseModelDropdown,
+    SelectDropdownLocal(String),
+    SelectDropdownCloud {
+        backend: String,
+        model_id: String,
+    },
     InstallLocalEngine,
     CycleLanguage,
     CycleHotkeyMode,
@@ -87,7 +116,9 @@ pub enum HitTarget {
     ToggleVad,
     CycleDelivery,
     ToggleTheme,
-    OpenApiKey(String),
+    OpenProviderConfig(String),
+    FocusProviderField(ProviderField),
+    ToggleRevealKey,
     FocusModelSearch,
     ClearModelSearch,
     SetModelTab(ModelFilterTab),
@@ -96,7 +127,7 @@ pub enum HitTarget {
     SelectHistory(usize),
     CopyHistory(usize),
     TypeHistory(usize),
-    DeleteHistory(usize),
+    RequestDeleteHistory(usize),
     Scrollbar {
         list: ScrollList,
         track_y: i32,
@@ -104,17 +135,22 @@ pub enum HitTarget {
         total: usize,
         visible: usize,
     },
-    SaveApiKey,
+    SaveProviderConfig,
+    ConfirmDownloadModel,
+    ConfirmDeleteClip,
     CloseModal,
 }
 
 impl HitTarget {
     pub fn is_text_input(&self) -> bool {
-        matches!(self, Self::FocusModelSearch)
+        matches!(self, Self::FocusModelSearch | Self::FocusProviderField(_))
     }
 
     pub fn is_pointer(&self) -> bool {
-        !matches!(self, Self::DragWindow | Self::FocusModelSearch)
+        !matches!(
+            self,
+            Self::DragWindow | Self::FocusModelSearch | Self::FocusProviderField(_)
+        )
     }
 }
 
@@ -131,6 +167,7 @@ pub struct UiSnapshot<'a> {
     pub model_tab: ModelFilterTab,
     pub model_filter: &'a str,
     pub model_search_focused: bool,
+    pub model_dropdown_open: bool,
     pub caret_visible: bool,
     pub model_selected: usize,
     pub model_scroll: usize,
@@ -372,6 +409,113 @@ fn draw_chip(
     w
 }
 
+/// Draw an SVG icon mathematically centered inside `rect`.
+fn draw_centered_icon(
+    dl: &mut DrawList,
+    te: &mut TextEngine,
+    icon: IconId,
+    rect: Rect,
+    icon_size: f32,
+    color: Rgba,
+) {
+    let ix = rect.x + (rect.w - icon_size) * 0.5;
+    let iy = rect.y + (rect.h - icon_size) * 0.5;
+    dl.draw_icon(te, icon, ix, iy, icon_size, color);
+}
+
+/// Draw a sleek floating tooltip pill anchored above (or below if near top) `anchor`.
+fn draw_tooltip(
+    dl: &mut DrawList,
+    te: &mut TextEngine,
+    pal: &Palette,
+    win_w: f32,
+    win_h: f32,
+    anchor: Rect,
+    text: &str,
+) {
+    let tw = te.measure(text, 11.5, FontWeight::Semibold);
+    let pw = tw + 18.0;
+    let ph = 24.0;
+    let mut px = anchor.x + (anchor.w - pw) * 0.5;
+    px = px.clamp(8.0, (win_w - pw - 8.0).max(8.0));
+    let mut py = anchor.y - ph - 6.0;
+    if py < 6.0 {
+        py = (anchor.y + anchor.h + 6.0).min((win_h - ph - 6.0).max(6.0));
+    }
+    let rect = Rect::new(px, py, pw, ph);
+    dl.fill_rect_bordered(rect, 7.0, pal.bg_element, 1.0, pal.ring);
+    dl.draw_text_centered(te, rect, 11.5, pal.fg, FontWeight::Semibold, text);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_modal_button(
+    dl: &mut DrawList,
+    te: &mut TextEngine,
+    hits: &mut Vec<HitZone>,
+    pal: &Palette,
+    x: f32,
+    y: f32,
+    height: f32,
+    label: &str,
+    tone: ModalBtnTone,
+    target: HitTarget,
+    mouse: (f32, f32),
+    hover_t: f32,
+    pressed: Option<&HitTarget>,
+) -> f32 {
+    let weight = match tone {
+        ModalBtnTone::Secondary => FontWeight::Semibold,
+        ModalBtnTone::Primary | ModalBtnTone::Danger => FontWeight::Bold,
+    };
+    let text_w = te.measure(label, 12.5, weight);
+    let w = (text_w + 28.0).max(84.0);
+    let is_pressed = pressed.is_some_and(|p| p == &target);
+    let dy = if is_pressed { 1.0 } else { 0.0 };
+    let rect = Rect::new(x, y + dy, w, height);
+    let hovered = rect.contains(mouse.0, mouse.1);
+    let ht = if hovered { hover_t } else { 0.0 };
+
+    let (base_fill, hover_fill, base_fg, hover_fg, border) = match tone {
+        ModalBtnTone::Primary => (
+            pal.accent_soft,
+            pal.accent,
+            pal.accent,
+            Rgba::rgb(255, 255, 255),
+            pal.accent,
+        ),
+        ModalBtnTone::Danger => (
+            pal.error.with_alpha(38),
+            pal.error,
+            pal.error,
+            Rgba::rgb(255, 255, 255),
+            pal.error,
+        ),
+        ModalBtnTone::Secondary => (
+            pal.bg_element,
+            if is_pressed { pal.bg_active } else { pal.bg_hover },
+            pal.fg_muted,
+            pal.fg,
+            pal.ring,
+        ),
+    };
+    let fill = base_fill.lerp(hover_fill, ht);
+    let fg = base_fg.lerp(hover_fg, ht);
+    dl.fill_rect_bordered(rect, 8.0, fill, 1.0, border);
+    dl.draw_text_centered(te, rect, 12.5, fg, weight, label);
+    hits.push(HitZone {
+        rect: Rect::new(x, y, w, height),
+        target,
+    });
+    w
+}
+
+#[derive(Clone, Copy)]
+enum ModalBtnTone {
+    Primary,
+    Danger,
+    Secondary,
+}
+
 pub fn render_main_window(
     dl: &mut DrawList,
     te: &mut TextEngine,
@@ -379,6 +523,7 @@ pub fn render_main_window(
 ) -> Vec<HitZone> {
     let pal = palette();
     let mut hits = Vec::with_capacity(96);
+    let mut tooltip: Option<(Rect, &'static str)> = None;
     let w = snap.width;
     let h = snap.height;
     let sidebar_w = 224.0_f32.min(w * 0.30);
@@ -396,11 +541,11 @@ pub fn render_main_window(
 
     // Window controls (Electron SVG icons: minus, maximize-2, x) on top-right
     let win_btns = [
-        (IconId::Minus, HitTarget::MinimizeWindow, false),
-        (IconId::Maximize, HitTarget::MaximizeWindow, false),
-        (IconId::Close, HitTarget::CloseWindow, true),
+        (IconId::Minus, HitTarget::MinimizeWindow, false, "Minimize"),
+        (IconId::Maximize, HitTarget::MaximizeWindow, false, "Maximize / Restore"),
+        (IconId::Close, HitTarget::CloseWindow, true, "Hide to System Tray"),
     ];
-    for (i, (icon, target, is_close)) in win_btns.into_iter().enumerate() {
+    for (i, (icon, target, is_close, tip)) in win_btns.into_iter().enumerate() {
         let bx = w - 126.0 + i as f32 * 42.0;
         let rect = Rect::new(bx, 0.0, 42.0, titlebar_h);
         let hov = rect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
@@ -414,12 +559,13 @@ pub fn render_main_window(
                     pal.bg_hover
                 },
             );
+            tooltip = Some((rect, tip));
         }
-        dl.draw_icon(
+        draw_centered_icon(
+            dl,
             te,
             icon,
-            bx + 14.0,
-            12.0,
+            rect,
             14.0,
             if hov && is_close {
                 Rgba::rgb(255, 255, 255)
@@ -433,14 +579,15 @@ pub fn render_main_window(
     }
 
     // ── 2. Sidebar Navigation ────────────────────────────────────────────────
+    let brand_tile = Rect::new(16.0, 12.0, 26.0, 26.0);
     dl.fill_rect_bordered(
-        Rect::new(16.0, 12.0, 26.0, 26.0),
+        brand_tile,
         7.0,
         Rgba::rgb(17, 17, 17),
         1.0,
         Rgba::rgba(255, 255, 255, 36),
     );
-    dl.draw_icon(te, IconId::Brand, 18.0, 14.0, 22.0, Rgba::rgb(255, 255, 255));
+    draw_centered_icon(dl, te, IconId::Brand, brand_tile, 20.0, Rgba::rgb(255, 255, 255));
     dl.draw_text_vcentered(te, 50.0, 25.0, 15.0, pal.fg, FontWeight::Bold, None, "Enio");
 
     let nav_items = [
@@ -604,9 +751,20 @@ pub fn render_main_window(
     );
 
     match snap.view {
-        AppView::Dictate => render_dictate_view(dl, te, &mut hits, &pal, content, snap, runtime_ready),
-        AppView::Models => render_models_view(dl, te, &mut hits, &pal, content, snap),
-        AppView::Settings => render_settings_view(dl, te, &mut hits, &pal, content, snap),
+        AppView::Dictate => render_dictate_view(
+            dl,
+            te,
+            &mut hits,
+            &mut tooltip,
+            &pal,
+            content,
+            snap,
+            runtime_ready,
+        ),
+        AppView::Models => render_models_view(dl, te, &mut hits, &mut tooltip, &pal, content, snap),
+        AppView::Settings => {
+            render_settings_view(dl, te, &mut hits, &mut tooltip, &pal, content, snap)
+        }
     }
 
     // Subtle 1px outer border around the frameless window
@@ -618,32 +776,73 @@ pub fn render_main_window(
         pal.seam,
     );
 
-    // ── 4. API Key / HF Token Modal ──────────────────────────────────────────
-    if let Modal::ApiKeyInput {
-        provider_id,
-        provider_name,
-        buffer,
-    } = snap.modal
-    {
-        render_api_key_modal(
-            dl,
-            te,
-            &mut hits,
-            &pal,
-            snap,
+    // Paint floating icon tooltip on top of main UI when no modal is blocking
+    if matches!(snap.modal, Modal::None) {
+        if let Some((anchor, tip_text)) = tooltip {
+            draw_tooltip(dl, te, &pal, w, h, anchor, tip_text);
+        }
+    }
+
+    // ── 4. Modals (Provider Config, Download Confirm, Delete Clip Confirm) ───
+    match snap.modal {
+        Modal::None => {}
+        Modal::ProviderConfig {
             provider_id,
             provider_name,
-            buffer,
-        );
+            is_self_hosted,
+            base_url,
+            model_id,
+            api_key,
+            active_field,
+            reveal_key,
+        } => {
+            render_provider_config_modal(
+                dl,
+                te,
+                &mut hits,
+                &pal,
+                snap,
+                provider_id,
+                provider_name,
+                *is_self_hosted,
+                base_url,
+                model_id,
+                api_key,
+                *active_field,
+                *reveal_key,
+            );
+        }
+        Modal::ConfirmDownload {
+            label,
+            size_mb,
+            engine_name,
+            ..
+        } => {
+            render_confirm_download_modal(
+                dl,
+                te,
+                &mut hits,
+                &pal,
+                snap,
+                label,
+                *size_mb,
+                engine_name,
+            );
+        }
+        Modal::ConfirmDeleteClip { preview, .. } => {
+            render_confirm_delete_modal(dl, te, &mut hits, &pal, snap, preview);
+        }
     }
 
     hits
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_dictate_view(
     dl: &mut DrawList,
     te: &mut TextEngine,
     hits: &mut Vec<HitZone>,
+    tooltip: &mut Option<(Rect, &'static str)>,
     pal: &Palette,
     area: Rect,
     snap: &UiSnapshot<'_>,
@@ -740,10 +939,19 @@ fn render_dictate_view(
     let bar_y = pill.y + pill_h - 44.0;
     let mut cx = pill.x + 14.0;
 
+    let model_chip_x = cx;
     let short_model = if snap.config.backend == "local" {
-        format!("{} ▾", snap.config.local_model)
+        format!(
+            "{} {}",
+            snap.config.local_model,
+            if snap.model_dropdown_open { "▴" } else { "▾" }
+        )
     } else {
-        format!("{} ▾", snap.config.commercial_model)
+        format!(
+            "{} {}",
+            snap.config.commercial_model,
+            if snap.model_dropdown_open { "▴" } else { "▾" }
+        )
     };
     cx += draw_chip(
         dl,
@@ -754,8 +962,8 @@ fn render_dictate_view(
         bar_y,
         30.0,
         &short_model,
-        false,
-        HitTarget::SwitchView(AppView::Models),
+        snap.model_dropdown_open,
+        HitTarget::ToggleModelDropdown,
         snap.mouse_pos,
         snap.hover_t,
         snap.pressed_target,
@@ -807,7 +1015,7 @@ fn render_dictate_view(
         let action_target = if snap.config.backend == "local" {
             HitTarget::InstallLocalEngine
         } else {
-            HitTarget::OpenApiKey(snap.config.backend.clone())
+            HitTarget::OpenProviderConfig(snap.config.backend.clone())
         };
         let _ = draw_chip(
             dl,
@@ -846,23 +1054,26 @@ fn render_dictate_view(
     }
     dl.fill_circle(btn_cx, btn_cy, btn_r, btn_fill);
     if is_rec {
-        dl.draw_icon(
-            te,
-            IconId::Square,
-            btn_cx - 7.5,
-            btn_cy - 7.5,
-            15.0,
-            Rgba::rgb(255, 255, 255),
-        );
+        draw_centered_icon(dl, te, IconId::Square, btn_rect, 14.0, Rgba::rgb(255, 255, 255));
     } else {
-        dl.draw_icon(
+        draw_centered_icon(
+            dl,
             te,
             IconId::Mic,
-            btn_cx - 8.5,
-            btn_cy - 8.5,
-            17.0,
+            btn_rect,
+            16.0,
             if btn_hov { pal.accent } else { pal.fg },
         );
+    }
+    if btn_hov && !snap.model_dropdown_open {
+        *tooltip = Some((
+            btn_rect,
+            if is_rec {
+                "Stop & transcribe (Space)"
+            } else {
+                "Start dictation (Space)"
+            },
+        ));
     }
     hits.push(HitZone {
         rect: btn_rect,
@@ -987,26 +1198,29 @@ fn render_dictate_view(
             &meta,
         );
 
-        // Inline quiet SVG icon actions on hover or selection
+        // Inline quiet SVG icon actions on hover or selection (mathematically centered + tooltips)
         if is_hov || is_sel {
             let mut ax = rrect.x + rrect.w - 8.0;
-            for (icon, target, is_del) in [
-                (IconId::Trash, HitTarget::DeleteHistory(idx), true),
-                (IconId::Globe, HitTarget::TypeHistory(idx), false),
-                (IconId::Copy, HitTarget::CopyHistory(idx), false),
+            for (icon, target, is_del, tip) in [
+                (IconId::Trash, HitTarget::RequestDeleteHistory(idx), true, "Delete clip"),
+                (IconId::Globe, HitTarget::TypeHistory(idx), false, "Type into active window"),
+                (IconId::Copy, HitTarget::CopyHistory(idx), false, "Copy to clipboard"),
             ] {
-                let bw = 24.0;
+                let bw = 26.0;
                 ax -= bw;
-                let arect = Rect::new(ax, meta_y - 4.0, bw, 22.0);
+                let arect = Rect::new(ax, meta_y - 5.0, bw, 24.0);
                 let ahov = arect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
                 if ahov {
                     dl.fill_rect(arect, 6.0, pal.bg_hover);
+                    if !snap.model_dropdown_open {
+                        *tooltip = Some((arect, tip));
+                    }
                 }
-                dl.draw_icon(
+                draw_centered_icon(
+                    dl,
                     te,
                     icon,
-                    ax + 5.0,
-                    meta_y - 1.0,
+                    arect,
                     14.0,
                     if ahov && is_del {
                         pal.error
@@ -1047,12 +1261,222 @@ fn render_dictate_view(
             snap.dragging_scrollbar,
         );
     }
+
+    // Floating Model Selector Dropdown anchored under the composer pill model chip
+    if snap.model_dropdown_open {
+        render_model_dropdown(dl, te, hits, pal, snap, model_chip_x, bar_y + 34.0);
+    }
 }
 
+fn render_model_dropdown(
+    dl: &mut DrawList,
+    te: &mut TextEngine,
+    hits: &mut Vec<HitZone>,
+    pal: &Palette,
+    snap: &UiSnapshot<'_>,
+    anchor_x: f32,
+    anchor_y: f32,
+) {
+    use crate::catalog::COMMERCIAL_STT_PROVIDERS;
+
+    // Click-outside catcher behind the dropdown panel
+    hits.push(HitZone {
+        rect: Rect::new(0.0, 0.0, snap.width, snap.height),
+        target: HitTarget::CloseModelDropdown,
+    });
+
+    let installed = installed_local_models(snap.paths);
+    let mut ready_cloud: Vec<(&'static str, &'static str, String)> = Vec::new();
+    for prov in COMMERCIAL_STT_PROVIDERS {
+        if snap.config.has_api_key(prov.id) {
+            let mdl = snap
+                .config
+                .resolve_commercial_auth(prov.id)
+                .map(|(_, _, m)| m)
+                .unwrap_or_else(|| prov.default_model.to_string());
+            ready_cloud.push((prov.id, prov.name, mdl));
+            if ready_cloud.len() >= 5 {
+                break;
+            }
+        }
+    }
+
+    let dw = 316.0_f32.min(snap.width - 32.0);
+    let dx = anchor_x.clamp(12.0, (snap.width - dw - 12.0).max(12.0));
+
+    let row_h = 30.0;
+    let mut dh = 14.0;
+    if !installed.is_empty() {
+        dh += 22.0 + installed.len().min(6) as f32 * row_h;
+    }
+    if !ready_cloud.is_empty() {
+        dh += 24.0 + ready_cloud.len() as f32 * row_h;
+    }
+    dh += 38.0; // divider + "Browse all models…" footer
+    let max_h = (snap.height - anchor_y - 16.0).max(120.0);
+    let dh = dh.min(max_h);
+
+    let drect = Rect::new(dx, anchor_y, dw, dh);
+    dl.fill_rect_bordered(drect, 12.0, pal.bg_panel, 1.0, pal.ring);
+
+    let mut y = drect.y + 8.0;
+    if !installed.is_empty() {
+        dl.draw_text(
+            te,
+            drect.x + 12.0,
+            y + 2.0,
+            10.5,
+            pal.fg_dim,
+            FontWeight::Bold,
+            None,
+            1,
+            "INSTALLED LOCAL",
+        );
+        y += 20.0;
+        for mid in installed.iter().take(6) {
+            if y + row_h > drect.y + drect.h - 38.0 {
+                break;
+            }
+            let rrect = Rect::new(drect.x + 6.0, y, drect.w - 12.0, row_h - 2.0);
+            let is_cur = snap.config.backend == "local" && &snap.config.local_model == mid;
+            let hov = rrect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
+            if is_cur || hov {
+                dl.fill_rect(
+                    rrect,
+                    7.0,
+                    if is_cur { pal.bg_element } else { pal.bg_hover },
+                );
+            }
+            dl.fill_circle(
+                rrect.x + 11.0,
+                rrect.y + rrect.h * 0.5,
+                3.0,
+                if is_cur { pal.accent } else { pal.success },
+            );
+            dl.draw_text_vcentered(
+                te,
+                rrect.x + 22.0,
+                rrect.y + rrect.h * 0.5,
+                12.5,
+                if is_cur || hov { pal.fg } else { pal.fg_prose },
+                if is_cur {
+                    FontWeight::Bold
+                } else {
+                    FontWeight::Semibold
+                },
+                Some(rrect.w - 72.0),
+                mid,
+            );
+            let tag = if is_cur { "Active" } else { "Local" };
+            let tw = te.measure(tag, 11.0, FontWeight::Regular);
+            dl.draw_text_vcentered(
+                te,
+                rrect.x + rrect.w - tw - 10.0,
+                rrect.y + rrect.h * 0.5,
+                11.0,
+                if is_cur { pal.accent } else { pal.fg_dim },
+                FontWeight::Regular,
+                None,
+                tag,
+            );
+            hits.push(HitZone {
+                rect: rrect,
+                target: HitTarget::SelectDropdownLocal(mid.clone()),
+            });
+            y += row_h;
+        }
+    }
+
+    if !ready_cloud.is_empty() && y + 54.0 < drect.y + drect.h - 34.0 {
+        y += 4.0;
+        dl.draw_text(
+            te,
+            drect.x + 12.0,
+            y + 2.0,
+            10.5,
+            pal.fg_dim,
+            FontWeight::Bold,
+            None,
+            1,
+            "CLOUD & SELF-HOSTED",
+        );
+        y += 20.0;
+        for (pid, pname, mdl) in ready_cloud {
+            if y + row_h > drect.y + drect.h - 38.0 {
+                break;
+            }
+            let rrect = Rect::new(drect.x + 6.0, y, drect.w - 12.0, row_h - 2.0);
+            let is_cur = snap.config.backend == pid;
+            let hov = rrect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
+            if is_cur || hov {
+                dl.fill_rect(
+                    rrect,
+                    7.0,
+                    if is_cur { pal.bg_element } else { pal.bg_hover },
+                );
+            }
+            dl.fill_circle(
+                rrect.x + 11.0,
+                rrect.y + rrect.h * 0.5,
+                3.0,
+                if is_cur { pal.accent } else { pal.fg_dim },
+            );
+            let label = format!("{pname} · {mdl}");
+            dl.draw_text_vcentered(
+                te,
+                rrect.x + 22.0,
+                rrect.y + rrect.h * 0.5,
+                12.5,
+                if is_cur || hov { pal.fg } else { pal.fg_prose },
+                if is_cur {
+                    FontWeight::Bold
+                } else {
+                    FontWeight::Semibold
+                },
+                Some(rrect.w - 30.0),
+                &label,
+            );
+            hits.push(HitZone {
+                rect: rrect,
+                target: HitTarget::SelectDropdownCloud {
+                    backend: pid.to_string(),
+                    model_id: mdl,
+                },
+            });
+            y += row_h;
+        }
+    }
+
+    // Bottom divider + "Browse all models & providers…"
+    let foot_y = drect.y + drect.h - 34.0;
+    dl.fill_rect(Rect::new(drect.x + 8.0, foot_y - 3.0, drect.w - 16.0, 1.0), 0.0, pal.seam);
+    let browse_rect = Rect::new(drect.x + 6.0, foot_y, drect.w - 12.0, 28.0);
+    let browse_hov = browse_rect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
+    if browse_hov {
+        dl.fill_rect(browse_rect, 7.0, pal.bg_hover);
+    }
+    dl.draw_text_vcentered(
+        te,
+        browse_rect.x + 10.0,
+        browse_rect.y + browse_rect.h * 0.5,
+        12.5,
+        if browse_hov { pal.accent } else { pal.fg_muted },
+        FontWeight::Semibold,
+        None,
+        "Browse all models & providers…",
+    );
+    hits.push(HitZone {
+        rect: browse_rect,
+        target: HitTarget::SwitchView(AppView::Models),
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 fn render_models_view(
     dl: &mut DrawList,
     te: &mut TextEngine,
     hits: &mut Vec<HitZone>,
+    tooltip: &mut Option<(Rect, &'static str)>,
     pal: &Palette,
     area: Rect,
     snap: &UiSnapshot<'_>,
@@ -1178,12 +1602,13 @@ fn render_models_view(
         let clear_hov = clear_rect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
         if clear_hov {
             dl.fill_rect(clear_rect, 6.0, pal.bg_hover);
+            *tooltip = Some((clear_rect, "Clear filter"));
         }
-        dl.draw_icon(
+        draw_centered_icon(
+            dl,
             te,
             IconId::Close,
-            clear_rect.x + 5.0,
-            clear_rect.y + 5.0,
+            clear_rect,
             14.0,
             if clear_hov { pal.fg } else { pal.fg_muted },
         );
@@ -1289,6 +1714,9 @@ fn render_models_view(
             dl.fill_circle(rrect.x + 12.0, rrect.y + 20.0, 4.0, pal.accent);
         }
 
+        let has_cfg_btn = !choice.is_local;
+        let text_right_pad = if has_cfg_btn { 165.0 } else { 135.0 };
+
         dl.draw_text(
             te,
             rrect.x + 26.0,
@@ -1300,7 +1728,7 @@ fn render_models_view(
             } else {
                 FontWeight::Semibold
             },
-            Some(row_w - 135.0),
+            Some((row_w - text_right_pad).max(120.0)),
             1,
             &choice.label,
         );
@@ -1311,7 +1739,7 @@ fn render_models_view(
             11.5,
             pal.fg_dim,
             FontWeight::Regular,
-            Some(row_w - 135.0),
+            Some((row_w - text_right_pad).max(120.0)),
             1,
             &choice.detail,
         );
@@ -1327,7 +1755,7 @@ fn render_models_view(
         } else if snap.config.has_api_key(&choice.backend) {
             ("Ready", pal.success)
         } else {
-            ("Set Key", pal.warning)
+            ("Configure", pal.warning)
         };
         let bweight = if is_active {
             FontWeight::Bold
@@ -1335,9 +1763,14 @@ fn render_models_view(
             FontWeight::Semibold
         };
         let bw = te.measure(badge, 12.0, bweight);
+        let badge_right = if has_cfg_btn {
+            rrect.x + rrect.w - 44.0
+        } else {
+            rrect.x + rrect.w - 14.0
+        };
         dl.draw_text_vcentered(
             te,
-            rrect.x + rrect.w - bw - 14.0,
+            badge_right - bw,
             rrect.y + rrect.h * 0.5,
             12.0,
             bcol,
@@ -1350,6 +1783,40 @@ fn render_models_view(
             rect: rrect,
             target: HitTarget::PickModel(idx),
         });
+
+        // Centered Configure (Sliders) icon button for Cloud & Self-Hosted rows
+        if has_cfg_btn {
+            let cfg_rect = Rect::new(
+                rrect.x + rrect.w - 34.0,
+                rrect.y + (rrect.h - 26.0) * 0.5,
+                26.0,
+                26.0,
+            );
+            let cfg_hov = cfg_rect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
+            if cfg_hov {
+                dl.fill_rect_bordered(cfg_rect, 6.0, pal.bg_hover, 1.0, pal.ring);
+                *tooltip = Some((
+                    cfg_rect,
+                    if choice.backend == "custom" {
+                        "Configure Self-Hosted URL, model & key"
+                    } else {
+                        "Configure API key & endpoint"
+                    },
+                ));
+            }
+            draw_centered_icon(
+                dl,
+                te,
+                IconId::Sliders,
+                cfg_rect,
+                14.0,
+                if cfg_hov { pal.fg } else { pal.fg_dim },
+            );
+            hits.push(HitZone {
+                rect: cfg_rect,
+                target: HitTarget::OpenProviderConfig(choice.backend.clone()),
+            });
+        }
     }
 
     if has_scrollbar {
@@ -1370,10 +1837,12 @@ fn render_models_view(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_settings_view(
     dl: &mut DrawList,
     te: &mut TextEngine,
     hits: &mut Vec<HitZone>,
+    tooltip: &mut Option<(Rect, &'static str)>,
     pal: &Palette,
     area: Rect,
     snap: &UiSnapshot<'_>,
@@ -1518,37 +1987,136 @@ fn render_settings_view(
         HitTarget::ToggleVad,
     );
 
-    let hf_set = !snap.config.resolve_hf_token().is_empty();
+    // Self-Hosted OpenAI-Compatible Server row
+    let (_, custom_url, custom_model) = snap
+        .config
+        .resolve_commercial_auth("custom")
+        .unwrap_or_else(|| {
+            (
+                String::new(),
+                "http://127.0.0.1:8000/v1".to_string(),
+                "Qwen/Qwen3-ASR-1.7B".to_string(),
+            )
+        });
+    let short_url = custom_url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
     draw_row(
         dl,
         te,
         hits,
-        "Hugging Face Token (HF_TOKEN)",
-        "Authenticates gated Hugging Face downloads & HF Serverless Inference",
-        if hf_set { "Configured" } else { "Set HF Token" },
-        !hf_set,
-        HitTarget::OpenApiKey("huggingface".to_string()),
+        "Self-Hosted Server (vLLM / Speaches / Sherpa-ONNX)",
+        &format!("{short_url}  ·  {custom_model}"),
+        "Configure",
+        snap.config.backend == "custom",
+        HitTarget::OpenProviderConfig("custom".to_string()),
     );
 
-    let active_cloud_pid = if snap.config.backend == "local" {
-        "openai"
-    } else {
-        snap.config.backend.as_str()
-    };
-    let active_cloud_name = find_commercial_provider(active_cloud_pid)
-        .map(|p| p.name)
-        .unwrap_or(active_cloud_pid);
-    let cloud_set = snap.config.has_api_key(active_cloud_pid);
-    draw_row(
-        dl,
-        te,
-        hits,
-        &format!("Commercial Provider Key ({active_cloud_name})"),
-        "Configure API key for OpenAI, Groq, Deepgram, ElevenLabs, Mistral, Cartesia, Soniox…",
-        if cloud_set { "Configured" } else { "Set API Key" },
-        false,
-        HitTarget::OpenApiKey(active_cloud_pid.to_string()),
-    );
+    // Commercial & Cloud STT Providers quick-configure strip (shows green dot when ready)
+    {
+        dl.draw_text(
+            te,
+            col_x,
+            y + 2.0,
+            14.0,
+            pal.fg,
+            FontWeight::Semibold,
+            None,
+            1,
+            "Commercial & Cloud Providers",
+        );
+        dl.draw_text(
+            te,
+            col_x,
+            y + 21.0,
+            12.0,
+            pal.fg_dim,
+            FontWeight::Regular,
+            None,
+            1,
+            "Click any provider to configure its API key, base URL override, or default model",
+        );
+        y += 42.0;
+
+        let quick_providers = [
+            ("openai", "OpenAI"),
+            ("groq", "Groq"),
+            ("deepgram", "Deepgram"),
+            ("elevenlabs", "ElevenLabs"),
+            ("mistral", "Mistral"),
+            ("gemini", "Gemini"),
+            ("huggingface", "Hugging Face"),
+            ("cartesia", "Cartesia"),
+            ("soniox", "Soniox"),
+            ("assemblyai", "AssemblyAI"),
+        ];
+        let mut px = col_x;
+        let mut py = y;
+        let pill_h = 28.0;
+        for (pid, label) in quick_providers {
+            let ready = snap.config.has_api_key(pid);
+            let is_cur = snap.config.backend == pid;
+            let weight = if is_cur {
+                FontWeight::Bold
+            } else {
+                FontWeight::Semibold
+            };
+            let lw = te.measure(label, 12.0, weight);
+            let pw = (lw + 30.0).max(74.0);
+            if px + pw > col_x + col_w && px > col_x {
+                px = col_x;
+                py += pill_h + 6.0;
+            }
+            let target = HitTarget::OpenProviderConfig(pid.to_string());
+            let is_pressed = snap.pressed_target == Some(&target);
+            let prect = Rect::new(px, py + if is_pressed { 1.0 } else { 0.0 }, pw, pill_h);
+            let hov = prect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
+            let ht = if hov { snap.hover_t } else { 0.0 };
+            let fill = if is_cur {
+                pal.accent_soft.lerp(pal.accent, ht)
+            } else {
+                pal.bg_panel.lerp(
+                    if is_pressed { pal.bg_active } else { pal.bg_hover },
+                    ht,
+                )
+            };
+            let border = if is_cur { pal.accent } else { pal.ring };
+            dl.fill_rect_bordered(prect, 8.0, fill, 1.0, border);
+            let dot_col = if is_cur && hov {
+                Rgba::rgb(255, 255, 255)
+            } else if ready {
+                pal.success
+            } else {
+                pal.fg_dim.with_alpha(110)
+            };
+            dl.fill_circle(prect.x + 11.0, prect.y + prect.h * 0.5, 3.0, dot_col);
+            let fg = if is_cur {
+                pal.accent.lerp(Rgba::rgb(255, 255, 255), ht)
+            } else if hov || ready {
+                pal.fg
+            } else {
+                pal.fg_muted
+            };
+            dl.draw_text_vcentered(
+                te,
+                prect.x + 20.0,
+                prect.y + prect.h * 0.5,
+                12.0,
+                fg,
+                weight,
+                None,
+                label,
+            );
+            hits.push(HitZone {
+                rect: Rect::new(px, py, pw, pill_h),
+                target,
+            });
+            px += pw + 6.0;
+        }
+        y = py + pill_h + 14.0;
+        dl.fill_rect(Rect::new(col_x, y - 4.0, col_w, 1.0), 0.0, pal.seam);
+        y += 6.0;
+    }
 
     // Microphone selector + Refresh SVG button
     {
@@ -1584,6 +2152,9 @@ fn render_settings_view(
         );
         let ref_hov = ref_rect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
         let ref_ht = if ref_hov { snap.hover_t } else { 0.0 };
+        if ref_hov {
+            *tooltip = Some((ref_rect, "Refresh microphones"));
+        }
         dl.fill_rect_bordered(
             ref_rect,
             8.0,
@@ -1594,11 +2165,11 @@ fn render_settings_view(
             1.0,
             pal.ring,
         );
-        dl.draw_icon(
+        draw_centered_icon(
+            dl,
             te,
             IconId::Refresh,
-            ref_rect.x + 8.0,
-            ref_rect.y + 8.0,
+            ref_rect,
             14.0,
             if ref_hov { pal.fg } else { pal.fg_muted },
         );
@@ -1717,7 +2288,112 @@ fn render_settings_view(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn render_api_key_modal(
+fn draw_modal_input_field(
+    dl: &mut DrawList,
+    te: &mut TextEngine,
+    hits: &mut Vec<HitZone>,
+    pal: &Palette,
+    snap: &UiSnapshot<'_>,
+    x: f32,
+    y: f32,
+    w: f32,
+    label: &str,
+    placeholder: &str,
+    value: &str,
+    masked: bool,
+    focused: bool,
+    field: ProviderField,
+) -> f32 {
+    dl.draw_text(
+        te,
+        x,
+        y,
+        12.0,
+        if focused { pal.fg } else { pal.fg_muted },
+        FontWeight::Semibold,
+        None,
+        1,
+        label,
+    );
+    let frect = Rect::new(x, y + 18.0, w, 34.0);
+    let hov = frect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
+    let border = if focused {
+        pal.accent
+    } else if hov {
+        pal.fg_dim
+    } else {
+        pal.ring
+    };
+    dl.fill_rect_bordered(
+        frect,
+        8.0,
+        pal.bg_element,
+        if focused { 1.5 } else { 1.0 },
+        border,
+    );
+
+    let display = if value.is_empty() {
+        String::new()
+    } else if masked {
+        if value.len() <= 8 {
+            "*".repeat(value.len())
+        } else {
+            format!(
+                "{}{}{}",
+                &value[..4],
+                "*".repeat(value.len().saturating_sub(8).min(24)),
+                &value[value.len() - 4..]
+            )
+        }
+    } else {
+        value.to_string()
+    };
+
+    let tx = frect.x + 11.0;
+    let cy = frect.y + frect.h * 0.5;
+    let max_tw = frect.w - 22.0;
+
+    if display.is_empty() {
+        if focused && snap.caret_visible {
+            dl.fill_rect(Rect::new(tx, cy - 8.0, 1.5, 16.0), 0.75, pal.accent);
+        }
+        dl.draw_text_vcentered(
+            te,
+            tx + if focused { 4.0 } else { 0.0 },
+            cy,
+            13.0,
+            pal.fg_dim,
+            FontWeight::Regular,
+            Some(max_tw),
+            placeholder,
+        );
+    } else {
+        let drawn_w = dl.draw_text_vcentered(
+            te,
+            tx,
+            cy,
+            13.0,
+            pal.fg,
+            FontWeight::Regular,
+            Some(max_tw),
+            &display,
+        );
+        if focused && snap.caret_visible {
+            let cx = (tx + drawn_w + 1.5).min(tx + max_tw);
+            dl.fill_rect(Rect::new(cx, cy - 8.0, 1.5, 16.0), 0.75, pal.accent);
+        }
+    }
+
+    hits.push(HitZone {
+        rect: frect,
+        target: HitTarget::FocusProviderField(field),
+    });
+
+    y + 62.0
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_provider_config_modal(
     dl: &mut DrawList,
     te: &mut TextEngine,
     hits: &mut Vec<HitZone>,
@@ -1725,13 +2401,235 @@ fn render_api_key_modal(
     snap: &UiSnapshot<'_>,
     provider_id: &str,
     provider_name: &str,
-    buffer: &str,
+    is_self_hosted: bool,
+    base_url: &str,
+    model_id: &str,
+    api_key: &str,
+    active_field: ProviderField,
+    reveal_key: bool,
 ) {
     hits.clear();
     dl.fill_rect(Rect::new(0.0, 0.0, snap.width, snap.height), 0.0, pal.backdrop);
+    hits.push(HitZone {
+        rect: Rect::new(0.0, 0.0, snap.width, snap.height),
+        target: HitTarget::CloseModal,
+    });
 
-    let mw = 500.0_f32.min(snap.width - 48.0);
-    let mh = 200.0;
+    let mw = 540.0_f32.min(snap.width - 48.0);
+    let mh = if is_self_hosted { 336.0 } else { 278.0 };
+    let mx = (snap.width - mw) * 0.5;
+    let my = (snap.height - mh) * 0.5;
+    let mrect = Rect::new(mx, my, mw, mh);
+
+    dl.fill_rect_bordered(mrect, 18.0, pal.bg_panel, 1.0, pal.ring);
+    // Catch clicks inside modal so they don't close it
+    hits.push(HitZone {
+        rect: mrect,
+        target: HitTarget::FocusProviderField(active_field),
+    });
+
+    dl.fill_circle(mx + 22.0, my + 26.0, 4.5, pal.accent);
+    let heading = if is_self_hosted {
+        "Self-Hosted Speech Server".to_string()
+    } else {
+        format!("Configure {provider_name}")
+    };
+    dl.draw_text_vcentered(
+        te,
+        mx + 34.0,
+        my + 26.0,
+        15.5,
+        pal.fg,
+        FontWeight::Bold,
+        None,
+        &heading,
+    );
+
+    let spec = find_commercial_provider(provider_id);
+    let env_hint = spec
+        .and_then(|p| p.env_vars.first().copied())
+        .unwrap_or("API_KEY");
+    let default_url = spec
+        .map(|p| p.default_base_url)
+        .unwrap_or("http://127.0.0.1:8000/v1");
+    let subtitle = if is_self_hosted {
+        "OpenAI-compatible /v1/audio/transcriptions server (vLLM, Speaches, Sherpa-ONNX, faster-whisper)."
+            .to_string()
+    } else {
+        format!("Tab switches fields · Ctrl+V pastes · env fallback: ${env_hint}")
+    };
+    dl.draw_text(
+        te,
+        mx + 22.0,
+        my + 44.0,
+        12.0,
+        pal.fg_dim,
+        FontWeight::Regular,
+        Some(mw - 44.0),
+        1,
+        &subtitle,
+    );
+
+    let mut fy = my + 72.0;
+    let fw = mw - 44.0;
+
+    if is_self_hosted {
+        fy = draw_modal_input_field(
+            dl,
+            te,
+            hits,
+            pal,
+            snap,
+            mx + 22.0,
+            fy,
+            fw,
+            "Endpoint Base URL",
+            default_url,
+            base_url,
+            false,
+            active_field == ProviderField::BaseUrl,
+            ProviderField::BaseUrl,
+        );
+        fy = draw_modal_input_field(
+            dl,
+            te,
+            hits,
+            pal,
+            snap,
+            mx + 22.0,
+            fy,
+            fw,
+            "Model ID",
+            "Qwen/Qwen3-ASR-1.7B",
+            model_id,
+            false,
+            active_field == ProviderField::ModelId,
+            ProviderField::ModelId,
+        );
+        let _ = draw_modal_input_field(
+            dl,
+            te,
+            hits,
+            pal,
+            snap,
+            mx + 22.0,
+            fy,
+            fw,
+            "API Key (optional for localhost)",
+            "Leave empty for local servers, or paste Bearer token…",
+            api_key,
+            !reveal_key,
+            active_field == ProviderField::ApiKey,
+            ProviderField::ApiKey,
+        );
+    } else {
+        let key_label = if provider_id == "huggingface" {
+            "Hugging Face Token (HF_TOKEN)"
+        } else {
+            "API Key"
+        };
+        fy = draw_modal_input_field(
+            dl,
+            te,
+            hits,
+            pal,
+            snap,
+            mx + 22.0,
+            fy,
+            fw,
+            key_label,
+            "Paste key (Ctrl+V)…",
+            api_key,
+            !reveal_key,
+            active_field == ProviderField::ApiKey,
+            ProviderField::ApiKey,
+        );
+        let _ = draw_modal_input_field(
+            dl,
+            te,
+            hits,
+            pal,
+            snap,
+            mx + 22.0,
+            fy,
+            fw,
+            "Base URL Override (optional)",
+            default_url,
+            base_url,
+            false,
+            active_field == ProviderField::BaseUrl,
+            ProviderField::BaseUrl,
+        );
+    }
+
+    let btn_y = my + mh - 48.0;
+    let save_w = draw_modal_button(
+        dl,
+        te,
+        hits,
+        pal,
+        mx + 22.0,
+        btn_y,
+        32.0,
+        "Save (Enter)",
+        ModalBtnTone::Primary,
+        HitTarget::SaveProviderConfig,
+        snap.mouse_pos,
+        snap.hover_t,
+        snap.pressed_target,
+    );
+    let cancel_w = draw_modal_button(
+        dl,
+        te,
+        hits,
+        pal,
+        mx + 22.0 + save_w + 10.0,
+        btn_y,
+        32.0,
+        "Cancel (Esc)",
+        ModalBtnTone::Secondary,
+        HitTarget::CloseModal,
+        snap.mouse_pos,
+        snap.hover_t,
+        snap.pressed_target,
+    );
+    let _ = draw_modal_button(
+        dl,
+        te,
+        hits,
+        pal,
+        mx + 22.0 + save_w + 10.0 + cancel_w + 10.0,
+        btn_y,
+        32.0,
+        if reveal_key { "Hide Key" } else { "Show Key" },
+        ModalBtnTone::Secondary,
+        HitTarget::ToggleRevealKey,
+        snap.mouse_pos,
+        snap.hover_t,
+        snap.pressed_target,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_confirm_download_modal(
+    dl: &mut DrawList,
+    te: &mut TextEngine,
+    hits: &mut Vec<HitZone>,
+    pal: &Palette,
+    snap: &UiSnapshot<'_>,
+    label: &str,
+    size_mb: u32,
+    engine_name: &str,
+) {
+    hits.clear();
+    dl.fill_rect(Rect::new(0.0, 0.0, snap.width, snap.height), 0.0, pal.backdrop);
+    hits.push(HitZone {
+        rect: Rect::new(0.0, 0.0, snap.width, snap.height),
+        target: HitTarget::CloseModal,
+    });
+
+    let mw = 480.0_f32.min(snap.width - 48.0);
+    let mh = 176.0;
     let mx = (snap.width - mw) * 0.5;
     let my = (snap.height - mh) * 0.5;
     let mrect = Rect::new(mx, my, mw, mh);
@@ -1745,75 +2643,138 @@ fn render_api_key_modal(
         15.5,
         pal.fg,
         FontWeight::Bold,
-        None,
-        &format!("{provider_name} Key"),
+        Some(mw - 56.0),
+        "Download Speech Model?",
     );
-
-    let env_hint = find_commercial_provider(provider_id)
-        .and_then(|p| p.env_vars.first().copied())
-        .unwrap_or("API_KEY");
     dl.draw_text(
         te,
         mx + 22.0,
-        my + 46.0,
+        my + 50.0,
+        13.5,
+        pal.fg_prose,
+        FontWeight::Semibold,
+        Some(mw - 44.0),
+        1,
+        label,
+    );
+    dl.draw_text(
+        te,
+        mx + 22.0,
+        my + 74.0,
         12.5,
         pal.fg_dim,
         FontWeight::Regular,
-        None,
-        1,
-        &format!("Press Ctrl+V to paste, or set ${env_hint} in your environment."),
+        Some(mw - 44.0),
+        2,
+        &format!(
+            "Downloads ~{size_mb} MB model weights (plus {engine_name} runtime if not yet installed) to your local Enio folder."
+        ),
     );
 
-    let field = Rect::new(mx + 22.0, my + 78.0, mw - 44.0, 38.0);
-    dl.fill_rect_bordered(field, 8.0, pal.bg_element, 1.0, pal.accent);
-    let masked = if buffer.is_empty() {
-        "Paste key (Ctrl+V)…▏".to_string()
-    } else if buffer.len() <= 8 {
-        format!("{}▏", "*".repeat(buffer.len()))
-    } else {
-        format!(
-            "{}{}{}▏",
-            &buffer[..4],
-            "*".repeat(buffer.len().saturating_sub(8).min(24)),
-            &buffer[buffer.len() - 4..]
-        )
-    };
-    dl.draw_text_vcentered(
-        te,
-        field.x + 12.0,
-        field.y + field.h * 0.5,
-        13.5,
-        if buffer.is_empty() { pal.fg_dim } else { pal.fg },
-        FontWeight::Regular,
-        Some(field.w - 24.0),
-        &masked,
-    );
-
-    let save_w = draw_chip(
+    let btn_y = my + mh - 48.0;
+    let dl_w = draw_modal_button(
         dl,
         te,
         hits,
         pal,
         mx + 22.0,
-        my + mh - 48.0,
+        btn_y,
         32.0,
-        "Save Key (Enter)",
-        true,
-        HitTarget::SaveApiKey,
+        &format!("Download (~{size_mb} MB)"),
+        ModalBtnTone::Primary,
+        HitTarget::ConfirmDownloadModel,
         snap.mouse_pos,
         snap.hover_t,
         snap.pressed_target,
     );
-    let _ = draw_chip(
+    let _ = draw_modal_button(
         dl,
         te,
         hits,
         pal,
-        mx + 22.0 + save_w + 10.0,
-        my + mh - 48.0,
+        mx + 22.0 + dl_w + 10.0,
+        btn_y,
         32.0,
         "Cancel (Esc)",
-        false,
+        ModalBtnTone::Secondary,
+        HitTarget::CloseModal,
+        snap.mouse_pos,
+        snap.hover_t,
+        snap.pressed_target,
+    );
+}
+
+fn render_confirm_delete_modal(
+    dl: &mut DrawList,
+    te: &mut TextEngine,
+    hits: &mut Vec<HitZone>,
+    pal: &Palette,
+    snap: &UiSnapshot<'_>,
+    preview: &str,
+) {
+    hits.clear();
+    dl.fill_rect(Rect::new(0.0, 0.0, snap.width, snap.height), 0.0, pal.backdrop);
+    hits.push(HitZone {
+        rect: Rect::new(0.0, 0.0, snap.width, snap.height),
+        target: HitTarget::CloseModal,
+    });
+
+    let mw = 460.0_f32.min(snap.width - 48.0);
+    let mh = 172.0;
+    let mx = (snap.width - mw) * 0.5;
+    let my = (snap.height - mh) * 0.5;
+    let mrect = Rect::new(mx, my, mw, mh);
+
+    dl.fill_rect_bordered(mrect, 18.0, pal.bg_panel, 1.0, pal.ring);
+    dl.fill_circle(mx + 22.0, my + 26.0, 4.5, pal.error);
+    dl.draw_text_vcentered(
+        te,
+        mx + 34.0,
+        my + 26.0,
+        15.5,
+        pal.fg,
+        FontWeight::Bold,
+        None,
+        "Delete this clip?",
+    );
+    dl.draw_text(
+        te,
+        mx + 22.0,
+        my + 52.0,
+        13.0,
+        pal.fg_dim,
+        FontWeight::Regular,
+        Some(mw - 44.0),
+        2,
+        preview,
+    );
+
+    let btn_y = my + mh - 48.0;
+    let del_w = draw_modal_button(
+        dl,
+        te,
+        hits,
+        pal,
+        mx + 22.0,
+        btn_y,
+        32.0,
+        "Delete Clip (Enter)",
+        ModalBtnTone::Danger,
+        HitTarget::ConfirmDeleteClip,
+        snap.mouse_pos,
+        snap.hover_t,
+        snap.pressed_target,
+    );
+    let _ = draw_modal_button(
+        dl,
+        te,
+        hits,
+        pal,
+        mx + 22.0 + del_w + 10.0,
+        btn_y,
+        32.0,
+        "Cancel (Esc)",
+        ModalBtnTone::Secondary,
         HitTarget::CloseModal,
         snap.mouse_pos,
         snap.hover_t,

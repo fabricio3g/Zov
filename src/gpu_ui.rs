@@ -34,6 +34,7 @@ pub enum IconId {
     Maximize,
     Search,
     Refresh,
+    Sliders,
 }
 
 impl IconId {
@@ -54,6 +55,7 @@ impl IconId {
             Self::Maximize => include_str!("../assets/icons/maximize-2.svg"),
             Self::Search => include_str!("../assets/icons/search.svg"),
             Self::Refresh => include_str!("../assets/icons/refresh-cw.svg"),
+            Self::Sliders => include_str!("../assets/icons/sliders.svg"),
         }
     }
 }

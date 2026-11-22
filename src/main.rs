@@ -12,8 +12,8 @@ mod wav;
 
 use crate::audio::{list_input_devices, start_recording, ActiveRecording};
 use crate::catalog::{
-    find_commercial_provider, COMMERCIAL_STT_PROVIDERS, COMMERCIAL_TTS_CATALOG,
-    LOCAL_WHISPER_CATALOG,
+    find_commercial_provider, find_local_whisper_spec, LocalEngineKind, COMMERCIAL_STT_PROVIDERS,
+    COMMERCIAL_TTS_CATALOG, LOCAL_WHISPER_CATALOG,
 };
 use crate::config::{load_history, save_history, AppPaths, DictateConfig, HistoryEntry, HotkeyMode};
 use crate::engine::{
@@ -31,7 +31,8 @@ use crate::style::{palette, set_theme, toggle_theme, Rgba, Theme};
 use crate::tray::{create_winit_window_icon, spawn_tray_icon, TrayEvent};
 use crate::ui::{
     filtered_stt_choices, hit_test, render_main_window, render_overlay_pill, AppView,
-    DictationPhase, HitTarget, HitZone, Modal, ModelFilterTab, ScrollList, UiSnapshot,
+    DictationPhase, HitTarget, HitZone, Modal, ModelFilterTab, ProviderField, ScrollList,
+    UiSnapshot,
 };
 use crate::vad::HISTORY_BARS;
 use crate::wav::load_wav_normalized;
@@ -296,6 +297,7 @@ struct DictateDesktopApp {
     model_tab: ModelFilterTab,
     model_filter: String,
     model_search_focused: bool,
+    model_dropdown_open: bool,
     caret_blink_at: Instant,
     last_caret_on: bool,
     model_selected: usize,
@@ -368,6 +370,7 @@ impl DictateDesktopApp {
             model_tab: ModelFilterTab::All,
             model_filter: String::new(),
             model_search_focused: false,
+            model_dropdown_open: false,
             caret_blink_at: Instant::now(),
             last_caret_on: true,
             model_selected: 0,
@@ -564,23 +567,78 @@ impl DictateDesktopApp {
         }
     }
 
-    fn open_api_key_modal(&mut self, provider_id: String) {
-        let pname = find_commercial_provider(&provider_id)
+    fn open_provider_config_modal(&mut self, provider_id: String) {
+        let spec = find_commercial_provider(&provider_id);
+        let pname = spec
             .map(|p| p.name.to_string())
             .unwrap_or_else(|| provider_id.clone());
-        let existing = if provider_id == "huggingface" {
+        let is_self_hosted = provider_id == "custom";
+        let saved = self.config.providers.get(&provider_id);
+        let api_key = if provider_id == "huggingface" {
             self.config.resolve_hf_token()
         } else {
-            self.config
-                .providers
-                .get(&provider_id)
-                .map(|p| p.api_key.clone())
-                .unwrap_or_default()
+            saved.map(|p| p.api_key.clone()).unwrap_or_default()
         };
-        self.modal = Modal::ApiKeyInput {
+        let base_url = saved
+            .map(|p| p.base_url.clone())
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| {
+                if is_self_hosted {
+                    spec.map(|p| p.default_base_url.to_string())
+                        .unwrap_or_else(|| "http://127.0.0.1:8000/v1".to_string())
+                } else {
+                    String::new()
+                }
+            });
+        let model_id = saved
+            .map(|p| p.model.clone())
+            .filter(|m| !m.trim().is_empty())
+            .unwrap_or_else(|| {
+                if self.config.backend == provider_id && !self.config.commercial_model.is_empty() {
+                    self.config.commercial_model.clone()
+                } else {
+                    spec.map(|p| p.default_model.to_string()).unwrap_or_default()
+                }
+            });
+        self.model_dropdown_open = false;
+        self.caret_blink_at = Instant::now();
+        self.last_caret_on = true;
+        self.modal = Modal::ProviderConfig {
             provider_id,
             provider_name: pname,
-            buffer: existing,
+            is_self_hosted,
+            base_url,
+            model_id,
+            api_key,
+            active_field: if is_self_hosted {
+                ProviderField::BaseUrl
+            } else {
+                ProviderField::ApiKey
+            },
+            reveal_key: false,
+        };
+        self.request_redraws();
+    }
+
+    fn open_confirm_download_modal(&mut self, model_id: String) {
+        let spec = find_local_whisper_spec(&model_id);
+        let label = spec
+            .map(|s| s.label.to_string())
+            .unwrap_or_else(|| model_id.clone());
+        let size_mb = spec.map(|s| s.size_mb).unwrap_or(190);
+        let engine_name = spec
+            .map(|s| match s.engine {
+                LocalEngineKind::AudioCpp => "audio.cpp",
+                LocalEngineKind::WhisperCpp => "whisper.cpp",
+            })
+            .unwrap_or("whisper.cpp")
+            .to_string();
+        self.model_dropdown_open = false;
+        self.modal = Modal::ConfirmDownload {
+            model_id,
+            label,
+            size_mb,
+            engine_name,
         };
         self.request_redraws();
     }
@@ -598,15 +656,17 @@ impl DictateDesktopApp {
         self.model_selected = index;
 
         if choice.is_local {
-            self.config.backend = "local".to_string();
-            self.config.local_model = choice.model_id.clone();
-            self.config.save(&self.paths);
-            stop_whisper_server();
+            let mut probe_cfg = self.config.clone();
+            probe_cfg.backend = "local".to_string();
+            probe_cfg.local_model = choice.model_id.clone();
 
-            if !is_local_engine_ready(&self.paths, &self.config) {
-                self.view = AppView::Dictate;
-                self.start_local_install(choice.model_id);
+            if !is_local_engine_ready(&self.paths, &probe_cfg) {
+                self.open_confirm_download_modal(choice.model_id);
             } else {
+                self.config.backend = "local".to_string();
+                self.config.local_model = choice.model_id.clone();
+                self.config.save(&self.paths);
+                stop_whisper_server();
                 self.status_toast = Some(format!("Switched to {}", choice.model_id));
                 self.view = AppView::Dictate;
             }
@@ -615,7 +675,7 @@ impl DictateDesktopApp {
             self.config.commercial_model = choice.model_id.clone();
             self.config.save(&self.paths);
             if !self.config.has_api_key(&choice.backend) {
-                self.open_api_key_modal(choice.backend);
+                self.open_provider_config_modal(choice.backend);
             } else {
                 self.status_toast = Some(format!("Switched to {}", choice.model_id));
                 self.view = AppView::Dictate;
@@ -665,10 +725,35 @@ impl DictateDesktopApp {
             }
             HitTarget::SwitchView(v) => {
                 self.view = v;
+                self.model_dropdown_open = false;
             }
-            HitTarget::ToggleRecord => self.toggle_recording(None, false),
+            HitTarget::ToggleRecord => {
+                self.model_dropdown_open = false;
+                self.toggle_recording(None, false);
+            }
+            HitTarget::ToggleModelDropdown => {
+                self.model_dropdown_open = !self.model_dropdown_open;
+            }
+            HitTarget::CloseModelDropdown => {
+                self.model_dropdown_open = false;
+            }
+            HitTarget::SelectDropdownLocal(model_id) => {
+                self.model_dropdown_open = false;
+                self.config.backend = "local".to_string();
+                self.config.local_model = model_id.clone();
+                self.config.save(&self.paths);
+                stop_whisper_server();
+                self.status_toast = Some(format!("Switched to {model_id}"));
+            }
+            HitTarget::SelectDropdownCloud { backend, model_id } => {
+                self.model_dropdown_open = false;
+                self.config.backend = backend;
+                self.config.commercial_model = model_id.clone();
+                self.config.save(&self.paths);
+                self.status_toast = Some(format!("Switched to {model_id}"));
+            }
             HitTarget::InstallLocalEngine => {
-                self.start_local_install(self.config.local_model.clone());
+                self.open_confirm_download_modal(self.config.local_model.clone());
             }
             HitTarget::CycleLanguage => {
                 self.config.cycle_language();
@@ -735,7 +820,19 @@ impl DictateDesktopApp {
                 };
                 self.config.save(&self.paths);
             }
-            HitTarget::OpenApiKey(pid) => self.open_api_key_modal(pid),
+            HitTarget::OpenProviderConfig(pid) => self.open_provider_config_modal(pid),
+            HitTarget::FocusProviderField(field) => {
+                if let Modal::ProviderConfig { active_field, .. } = &mut self.modal {
+                    *active_field = field;
+                    self.caret_blink_at = Instant::now();
+                    self.last_caret_on = true;
+                }
+            }
+            HitTarget::ToggleRevealKey => {
+                if let Modal::ProviderConfig { reveal_key, .. } = &mut self.modal {
+                    *reveal_key = !*reveal_key;
+                }
+            }
             HitTarget::FocusModelSearch => {
                 self.model_search_focused = true;
                 self.caret_blink_at = Instant::now();
@@ -804,27 +901,59 @@ impl DictateDesktopApp {
                     }
                 }
             }
-            HitTarget::DeleteHistory(idx) => {
-                if idx < self.history.len() {
-                    self.history.remove(idx);
-                    if self.selected_history >= self.history.len() && self.selected_history > 0 {
-                        self.selected_history -= 1;
-                    }
-                    save_history(&self.paths, &self.history);
+            HitTarget::RequestDeleteHistory(idx) => {
+                if let Some(entry) = self.history.get(idx) {
+                    let preview = entry.text.trim().to_string();
+                    self.modal = Modal::ConfirmDeleteClip { index: idx, preview };
                 }
             }
-            HitTarget::SaveApiKey => {
-                if let Modal::ApiKeyInput {
+            HitTarget::SaveProviderConfig => {
+                if let Modal::ProviderConfig {
                     provider_id,
-                    buffer,
+                    provider_name,
+                    base_url,
+                    model_id,
+                    api_key,
                     ..
                 } = &self.modal
                 {
                     let pid = provider_id.clone();
-                    let val = buffer.clone();
-                    self.config.set_api_key(&pid, val);
+                    let pname = provider_name.clone();
+                    self.config.set_provider_config(
+                        &pid,
+                        api_key.clone(),
+                        base_url.clone(),
+                        model_id.clone(),
+                    );
                     self.config.save(&self.paths);
-                    self.status_toast = Some(format!("Saved key for {pid}"));
+                    self.status_toast = Some(format!("Saved {pname} configuration"));
+                    self.modal = Modal::None;
+                }
+            }
+            HitTarget::ConfirmDownloadModel => {
+                if let Modal::ConfirmDownload { model_id, .. } = &self.modal {
+                    let mid = model_id.clone();
+                    self.modal = Modal::None;
+                    self.config.backend = "local".to_string();
+                    self.config.local_model = mid.clone();
+                    self.config.save(&self.paths);
+                    stop_whisper_server();
+                    self.view = AppView::Dictate;
+                    self.start_local_install(mid);
+                }
+            }
+            HitTarget::ConfirmDeleteClip => {
+                if let Modal::ConfirmDeleteClip { index, .. } = &self.modal {
+                    let idx = *index;
+                    if idx < self.history.len() {
+                        self.history.remove(idx);
+                        if self.selected_history >= self.history.len() && self.selected_history > 0
+                        {
+                            self.selected_history -= 1;
+                        }
+                        save_history(&self.paths, &self.history);
+                        self.status_toast = Some("Deleted clip".to_string());
+                    }
                     self.modal = Modal::None;
                 }
             }
@@ -1066,7 +1195,9 @@ impl ApplicationHandler for DictateDesktopApp {
         if hover_animating {
             self.request_redraws();
         }
-        if self.view == AppView::Models && self.model_search_focused {
+        if (self.view == AppView::Models && self.model_search_focused)
+            || matches!(self.modal, Modal::ProviderConfig { .. })
+        {
             let caret_on = (self.caret_blink_at.elapsed().as_millis() / 530) % 2 == 0;
             if caret_on != self.last_caret_on {
                 self.last_caret_on = caret_on;
@@ -1275,6 +1406,14 @@ impl ApplicationHandler for DictateDesktopApp {
                             self.last_caret_on = true;
                             self.request_redraws();
                         }
+                        HitTarget::FocusProviderField(field) => {
+                            if let Modal::ProviderConfig { active_field, .. } = &mut self.modal {
+                                *active_field = field;
+                                self.caret_blink_at = Instant::now();
+                                self.last_caret_on = true;
+                                self.request_redraws();
+                            }
+                        }
                         HitTarget::Scrollbar {
                             list,
                             track_y,
@@ -1411,32 +1550,118 @@ impl ApplicationHandler for DictateDesktopApp {
                     return;
                 }
 
-                // API Key modal typing
-                if let Modal::ApiKeyInput { buffer, .. } = &mut self.modal {
-                    match &event.logical_key {
-                        Key::Named(NamedKey::Escape) => self.modal = Modal::None,
-                        Key::Named(NamedKey::Enter) => {
-                            self.execute_hit(event_loop, HitTarget::SaveApiKey);
-                            return;
-                        }
-                        Key::Named(NamedKey::Backspace) => {
-                            buffer.pop();
-                        }
-                        Key::Character(c) if ctrl && c.eq_ignore_ascii_case("v") => {
-                            if let Some(clip) = paste_from_clipboard() {
-                                buffer.push_str(clip.trim());
+                // Active modal keyboard handling (Provider Config, Confirm Download, Confirm Delete)
+                match &mut self.modal {
+                    Modal::None => {}
+                    Modal::ConfirmDownload { .. } => {
+                        match &event.logical_key {
+                            Key::Named(NamedKey::Escape) => self.modal = Modal::None,
+                            Key::Named(NamedKey::Enter) => {
+                                self.execute_hit(event_loop, HitTarget::ConfirmDownloadModel);
+                                return;
                             }
+                            _ => {}
                         }
-                        Key::Character(c) if ctrl && c.eq_ignore_ascii_case("u") => {
-                            buffer.clear();
-                        }
-                        Key::Character(c) if !ctrl => {
-                            buffer.push_str(c.as_str());
-                        }
-                        _ => {}
+                        self.request_redraws();
+                        return;
                     }
-                    self.request_redraws();
-                    return;
+                    Modal::ConfirmDeleteClip { .. } => {
+                        match &event.logical_key {
+                            Key::Named(NamedKey::Escape) => self.modal = Modal::None,
+                            Key::Named(NamedKey::Enter) => {
+                                self.execute_hit(event_loop, HitTarget::ConfirmDeleteClip);
+                                return;
+                            }
+                            _ => {}
+                        }
+                        self.request_redraws();
+                        return;
+                    }
+                    Modal::ProviderConfig {
+                        is_self_hosted,
+                        base_url,
+                        model_id,
+                        api_key,
+                        active_field,
+                        ..
+                    } => {
+                        let shift = self.modifiers.shift_key();
+                        match &event.logical_key {
+                            Key::Named(NamedKey::Escape) => self.modal = Modal::None,
+                            Key::Named(NamedKey::Enter) => {
+                                self.execute_hit(event_loop, HitTarget::SaveProviderConfig);
+                                return;
+                            }
+                            Key::Named(NamedKey::Tab) => {
+                                *active_field = if *is_self_hosted {
+                                    match (*active_field, shift) {
+                                        (ProviderField::BaseUrl, false) => ProviderField::ModelId,
+                                        (ProviderField::ModelId, false) => ProviderField::ApiKey,
+                                        (ProviderField::ApiKey, false) => ProviderField::BaseUrl,
+                                        (ProviderField::BaseUrl, true) => ProviderField::ApiKey,
+                                        (ProviderField::ModelId, true) => ProviderField::BaseUrl,
+                                        (ProviderField::ApiKey, true) => ProviderField::ModelId,
+                                    }
+                                } else {
+                                    match *active_field {
+                                        ProviderField::ApiKey => ProviderField::BaseUrl,
+                                        _ => ProviderField::ApiKey,
+                                    }
+                                };
+                                self.caret_blink_at = Instant::now();
+                                self.last_caret_on = true;
+                            }
+                            Key::Named(NamedKey::Backspace) => {
+                                let target_buf = match *active_field {
+                                    ProviderField::BaseUrl => base_url,
+                                    ProviderField::ModelId => model_id,
+                                    ProviderField::ApiKey => api_key,
+                                };
+                                if ctrl {
+                                    target_buf.clear();
+                                } else {
+                                    target_buf.pop();
+                                }
+                                self.caret_blink_at = Instant::now();
+                                self.last_caret_on = true;
+                            }
+                            Key::Character(c) if ctrl && c.eq_ignore_ascii_case("v") => {
+                                if let Some(clip) = paste_from_clipboard() {
+                                    let target_buf = match *active_field {
+                                        ProviderField::BaseUrl => base_url,
+                                        ProviderField::ModelId => model_id,
+                                        ProviderField::ApiKey => api_key,
+                                    };
+                                    target_buf.push_str(clip.trim());
+                                    self.caret_blink_at = Instant::now();
+                                    self.last_caret_on = true;
+                                }
+                            }
+                            Key::Character(c) if ctrl && c.eq_ignore_ascii_case("u") => {
+                                let target_buf = match *active_field {
+                                    ProviderField::BaseUrl => base_url,
+                                    ProviderField::ModelId => model_id,
+                                    ProviderField::ApiKey => api_key,
+                                };
+                                target_buf.clear();
+                                self.caret_blink_at = Instant::now();
+                                self.last_caret_on = true;
+                            }
+                            Key::Character(c) if !ctrl => {
+                                let target_buf = match *active_field {
+                                    ProviderField::BaseUrl => base_url,
+                                    ProviderField::ModelId => model_id,
+                                    ProviderField::ApiKey => api_key,
+                                };
+                                target_buf.push_str(c.as_str());
+                                self.caret_blink_at = Instant::now();
+                                self.last_caret_on = true;
+                            }
+                            _ => {}
+                        }
+                        self.request_redraws();
+                        return;
+                    }
                 }
 
                 // Models page live search & navigation
@@ -1536,7 +1761,10 @@ impl ApplicationHandler for DictateDesktopApp {
                 match &event.logical_key {
                     Key::Named(NamedKey::Space) => self.toggle_recording(None, false),
                     Key::Named(NamedKey::Escape) => {
-                        if let Some(rec) = self.active_recording.take() {
+                        if self.model_dropdown_open {
+                            self.model_dropdown_open = false;
+                            self.request_redraws();
+                        } else if let Some(rec) = self.active_recording.take() {
                             drop(rec);
                             self.phase = DictationPhase::Idle;
                             self.set_overlay_visible(false);
@@ -1593,6 +1821,7 @@ impl ApplicationHandler for DictateDesktopApp {
                         model_tab: self.model_tab,
                         model_filter: &self.model_filter,
                         model_search_focused: self.model_search_focused,
+                        model_dropdown_open: self.model_dropdown_open,
                         caret_visible: self.last_caret_on,
                         model_selected: self.model_selected,
                         model_scroll: self.model_scroll,
