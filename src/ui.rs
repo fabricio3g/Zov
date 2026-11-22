@@ -149,7 +149,10 @@ impl HitTarget {
     pub fn is_pointer(&self) -> bool {
         !matches!(
             self,
-            Self::DragWindow | Self::FocusModelSearch | Self::FocusProviderField(_)
+            Self::DragWindow
+                | Self::FocusModelSearch
+                | Self::FocusProviderField(_)
+                | Self::CloseModelDropdown
         )
     }
 }
@@ -1123,143 +1126,142 @@ fn render_dictate_view(
             2,
             "Your dictations appear here. Use Ctrl+Shift+Space from any window to speak directly into editors, browsers, or chat inputs.",
         );
-        return;
-    }
-
-    let start = snap.history_scroll.min(snap.history.len().saturating_sub(1));
-    let list_top_y = cur_y;
-    let mut rendered_count = 0usize;
-    let row_col_w = if snap.history.len() > 3 {
-        col_w - 14.0
     } else {
-        col_w
-    };
-    for (idx, entry) in snap.history.iter().enumerate().skip(start) {
-        let text_w = row_col_w - 28.0;
-        let lines = te.measure_wrapped_lines(&entry.text, 14.5, text_w, 3);
-        let row_h = 34.0 + lines as f32 * 21.0;
-        if cur_y + row_h > bottom {
-            break;
-        }
-        rendered_count += 1;
-
-        let rrect = Rect::new(col_x, cur_y, row_col_w, row_h);
-        let is_sel = idx == snap.selected_history;
-        let is_hov = rrect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
-
-        if is_sel || is_hov {
-            dl.fill_rect(
-                rrect,
-                10.0,
-                if is_sel { pal.bg_panel } else { pal.bg_panel.with_alpha(150) },
-            );
-            dl.fill_rect(
-                Rect::new(rrect.x + 2.0, rrect.y + 10.0, 2.5, row_h - 20.0),
-                1.25,
-                pal.accent,
-            );
-        }
-        hits.push(HitZone {
-            rect: rrect,
-            target: HitTarget::SelectHistory(idx),
-        });
-
-        // Transcript body
-        dl.draw_text(
-            te,
-            rrect.x + 14.0,
-            rrect.y + 10.0,
-            14.5,
-            pal.fg_prose,
-            FontWeight::Regular,
-            Some(text_w),
-            3,
-            &entry.text,
-        );
-
-        // Quiet metadata row underneath
-        let meta_y = rrect.y + row_h - 22.0;
-        let meta = format!(
-            "{}  ·  {}  ·  {:.1}s  ·  {}ms",
-            entry.created_at.format("%H:%M"),
-            entry.model,
-            entry.duration_secs,
-            entry.elapsed_ms
-        );
-        dl.draw_text(
-            te,
-            rrect.x + 14.0,
-            meta_y,
-            11.5,
-            pal.fg_dim,
-            FontWeight::Regular,
-            None,
-            1,
-            &meta,
-        );
-
-        // Inline quiet SVG icon actions on hover or selection (mathematically centered + tooltips)
-        if is_hov || is_sel {
-            let mut ax = rrect.x + rrect.w - 8.0;
-            for (icon, target, is_del, tip) in [
-                (IconId::Trash, HitTarget::RequestDeleteHistory(idx), true, "Delete clip"),
-                (IconId::Globe, HitTarget::TypeHistory(idx), false, "Type into active window"),
-                (IconId::Copy, HitTarget::CopyHistory(idx), false, "Copy to clipboard"),
-            ] {
-                let bw = 26.0;
-                ax -= bw;
-                let arect = Rect::new(ax, meta_y - 5.0, bw, 24.0);
-                let ahov = arect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
-                if ahov {
-                    dl.fill_rect(arect, 6.0, pal.bg_hover);
-                    if !snap.model_dropdown_open {
-                        *tooltip = Some((arect, tip));
-                    }
-                }
-                draw_centered_icon(
-                    dl,
-                    te,
-                    icon,
-                    arect,
-                    14.0,
-                    if ahov && is_del {
-                        pal.error
-                    } else if ahov {
-                        pal.fg
-                    } else {
-                        pal.fg_dim
-                    },
-                );
-                hits.push(HitZone { rect: arect, target });
-                ax -= 4.0;
+        let start = snap.history_scroll.min(snap.history.len().saturating_sub(1));
+        let list_top_y = cur_y;
+        let mut rendered_count = 0usize;
+        let row_col_w = if snap.history.len() > 3 {
+            col_w - 14.0
+        } else {
+            col_w
+        };
+        for (idx, entry) in snap.history.iter().enumerate().skip(start) {
+            let text_w = row_col_w - 28.0;
+            let lines = te.measure_wrapped_lines(&entry.text, 14.5, text_w, 3);
+            let row_h = 34.0 + lines as f32 * 21.0;
+            if cur_y + row_h > bottom {
+                break;
             }
+            rendered_count += 1;
+
+            let rrect = Rect::new(col_x, cur_y, row_col_w, row_h);
+            let is_sel = idx == snap.selected_history;
+            let is_hov = rrect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
+
+            if is_sel || is_hov {
+                dl.fill_rect(
+                    rrect,
+                    10.0,
+                    if is_sel { pal.bg_panel } else { pal.bg_panel.with_alpha(150) },
+                );
+                dl.fill_rect(
+                    Rect::new(rrect.x + 2.0, rrect.y + 10.0, 2.5, row_h - 20.0),
+                    1.25,
+                    pal.accent,
+                );
+            }
+            hits.push(HitZone {
+                rect: rrect,
+                target: HitTarget::SelectHistory(idx),
+            });
+
+            // Transcript body
+            dl.draw_text(
+                te,
+                rrect.x + 14.0,
+                rrect.y + 10.0,
+                14.5,
+                pal.fg_prose,
+                FontWeight::Regular,
+                Some(text_w),
+                3,
+                &entry.text,
+            );
+
+            // Quiet metadata row underneath
+            let meta_y = rrect.y + row_h - 22.0;
+            let meta = format!(
+                "{}  ·  {}  ·  {:.1}s  ·  {}ms",
+                entry.created_at.format("%H:%M"),
+                entry.model,
+                entry.duration_secs,
+                entry.elapsed_ms
+            );
+            dl.draw_text(
+                te,
+                rrect.x + 14.0,
+                meta_y,
+                11.5,
+                pal.fg_dim,
+                FontWeight::Regular,
+                None,
+                1,
+                &meta,
+            );
+
+            // Inline quiet SVG icon actions on hover or selection (mathematically centered + tooltips)
+            if is_hov || is_sel {
+                let mut ax = rrect.x + rrect.w - 8.0;
+                for (icon, target, is_del, tip) in [
+                    (IconId::Trash, HitTarget::RequestDeleteHistory(idx), true, "Delete clip"),
+                    (IconId::Globe, HitTarget::TypeHistory(idx), false, "Type into active window"),
+                    (IconId::Copy, HitTarget::CopyHistory(idx), false, "Copy to clipboard"),
+                ] {
+                    let bw = 26.0;
+                    ax -= bw;
+                    let arect = Rect::new(ax, meta_y - 5.0, bw, 24.0);
+                    let ahov = arect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
+                    if ahov {
+                        dl.fill_rect(arect, 6.0, pal.bg_hover);
+                        if !snap.model_dropdown_open {
+                            *tooltip = Some((arect, tip));
+                        }
+                    }
+                    draw_centered_icon(
+                        dl,
+                        te,
+                        icon,
+                        arect,
+                        14.0,
+                        if ahov && is_del {
+                            pal.error
+                        } else if ahov {
+                            pal.fg
+                        } else {
+                            pal.fg_dim
+                        },
+                    );
+                    hits.push(HitZone { rect: arect, target });
+                    ax -= 4.0;
+                }
+            }
+
+            // Subtle separator line
+            dl.fill_rect(
+                Rect::new(col_x + 12.0, cur_y + row_h + 2.0, row_col_w - 24.0, 1.0),
+                0.0,
+                pal.seam,
+            );
+            cur_y += row_h + 6.0;
         }
 
-        // Subtle separator line
-        dl.fill_rect(
-            Rect::new(col_x + 12.0, cur_y + row_h + 2.0, row_col_w - 24.0, 1.0),
-            0.0,
-            pal.seam,
-        );
-        cur_y += row_h + 6.0;
-    }
-
-    let visible_hist = rendered_count.max(1);
-    if snap.history.len() > visible_hist {
-        draw_scrollbar(
-            dl,
-            hits,
-            pal,
-            ScrollList::History,
-            col_x + col_w - 7.0,
-            list_top_y,
-            (bottom - list_top_y).max(24.0),
-            start,
-            visible_hist,
-            snap.history.len(),
-            snap.mouse_pos,
-            snap.dragging_scrollbar,
-        );
+        let visible_hist = rendered_count.max(1);
+        if snap.history.len() > visible_hist {
+            draw_scrollbar(
+                dl,
+                hits,
+                pal,
+                ScrollList::History,
+                col_x + col_w - 7.0,
+                list_top_y,
+                (bottom - list_top_y).max(24.0),
+                start,
+                visible_hist,
+                snap.history.len(),
+                snap.mouse_pos,
+                snap.dragging_scrollbar,
+            );
+        }
     }
 
     // Floating Model Selector Dropdown anchored under the composer pill model chip
