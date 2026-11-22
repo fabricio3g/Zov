@@ -87,18 +87,18 @@ pub fn build_multipart_form(
 // LOCAL WHISPER DISCOVERY (Standalone + Shared Agente Desktop folders)
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-fn find_whisper_binary_in_dir(dir: &Path) -> Option<PathBuf> {
+fn find_binary_in_dir(dir: &Path, names: &[&str]) -> Option<PathBuf> {
     if !dir.exists() {
         return None;
     }
-    for &bin in WHISPER_CLI_NAMES {
+    for &bin in names {
         let top = dir.join(bin);
         if top.is_file() {
             return Some(top);
         }
     }
     let mut found = Vec::new();
-    fn walk(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    fn walk(dir: &Path, depth: usize, names: &[&str], out: &mut Vec<PathBuf>) {
         if depth > 3 {
             return;
         }
@@ -108,21 +108,18 @@ fn find_whisper_binary_in_dir(dir: &Path) -> Option<PathBuf> {
         for entry in entries.flatten() {
             let full = entry.path();
             if full.is_dir() {
-                walk(&full, depth + 1, out);
+                walk(&full, depth + 1, names, out);
             } else if let Some(name) = full.file_name().and_then(|s| s.to_str()) {
-                if WHISPER_CLI_NAMES.contains(&name) {
+                if names.contains(&name) {
                     out.push(full);
                 }
             }
         }
     }
-    walk(dir, 0, &mut found);
+    walk(dir, 0, names, &mut found);
     found.sort_by_key(|p| {
         let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        WHISPER_CLI_NAMES
-            .iter()
-            .position(|&n| n == name)
-            .unwrap_or(usize::MAX)
+        names.iter().position(|&n| n == name).unwrap_or(usize::MAX)
     });
     found.into_iter().next()
 }
@@ -135,7 +132,7 @@ pub fn resolve_whisper_binary(paths: &AppPaths, cfg: &DictateConfig) -> Option<P
         }
     }
     for root in &paths.shared_whisper_bin_roots {
-        if let Some(bin) = find_whisper_binary_in_dir(root) {
+        if let Some(bin) = find_binary_in_dir(root, WHISPER_CLI_NAMES) {
             return Some(bin);
         }
     }
@@ -161,6 +158,9 @@ pub fn resolve_audiocpp_binary(paths: &AppPaths) -> Option<PathBuf> {
                 return Some(candidate);
             }
         }
+        if let Some(bin) = find_binary_in_dir(root, &[AUDIOCPP_SERVER_NAME]) {
+            return Some(bin);
+        }
     }
     None
 }
@@ -173,9 +173,17 @@ pub fn is_local_engine_ready(paths: &AppPaths, cfg: &DictateConfig) -> bool {
     if !model_ok {
         return false;
     }
-    match spec.engine {
-        LocalEngineKind::WhisperCpp => resolve_whisper_binary(paths, cfg).is_some(),
-        LocalEngineKind::AudioCpp => resolve_audiocpp_binary(paths).is_some(),
+    resolve_speech_engine(paths, cfg, spec.engine).is_some()
+}
+
+fn resolve_speech_engine(
+    paths: &AppPaths,
+    cfg: &DictateConfig,
+    engine: LocalEngineKind,
+) -> Option<PathBuf> {
+    match engine {
+        LocalEngineKind::WhisperCpp => resolve_whisper_binary(paths, cfg),
+        LocalEngineKind::AudioCpp => resolve_audiocpp_binary(paths),
     }
 }
 
@@ -200,6 +208,39 @@ pub fn installed_local_models(paths: &AppPaths) -> Vec<String> {
         .filter(|spec| check_local_whisper_model(paths, spec.id).is_some())
         .map(|spec| spec.id.to_string())
         .collect()
+}
+
+#[derive(Default, PartialEq, Eq)]
+pub struct LocalInventory {
+    pub installed: Vec<String>,
+    whisper: bool,
+    audio: bool,
+}
+
+impl LocalInventory {
+    pub fn scan(paths: &AppPaths, config: &DictateConfig) -> Self {
+        Self {
+            installed: installed_local_models(paths),
+            whisper: resolve_whisper_binary(paths, config).is_some(),
+            audio: resolve_audiocpp_binary(paths).is_some(),
+        }
+    }
+
+    pub fn contains(&self, model_id: &str) -> bool {
+        self.installed.iter().any(|id| id == model_id)
+    }
+
+    pub fn is_ready(&self, model_id: &str) -> bool {
+        self.contains(model_id)
+            && find_local_whisper_spec(model_id).is_some_and(|spec| self.has_engine(spec.engine))
+    }
+
+    pub fn has_engine(&self, engine: LocalEngineKind) -> bool {
+        match engine {
+            LocalEngineKind::WhisperCpp => self.whisper,
+            LocalEngineKind::AudioCpp => self.audio,
+        }
+    }
 }
 
 fn has_own_gpu_backend(server_dir: &Path) -> bool {
@@ -1250,55 +1291,330 @@ fn select_whisper_asset(assets: &[Value]) -> Option<(String, String)> {
     None
 }
 
-async fn download_with_progress<F>(
-    url: &str,
-    dest: &Path,
-    bearer_token: Option<&str>,
-    mut on_progress: F,
-) -> Result<()>
-where
-    F: FnMut(u8),
-{
-    let client = reqwest::Client::builder()
-        .user_agent("AgenteDictate/0.1")
-        .build()?;
-    let mut req = client.get(url);
-    if let Some(tok) = bearer_token.filter(|t| !t.trim().is_empty()) {
-        req = req.header("Authorization", format!("Bearer {}", tok.trim()));
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DownloadProgress {
+    received: u64,
+    total: Option<u64>,
+    bytes_per_second: u64,
+}
+
+impl DownloadProgress {
+    pub fn fraction(self) -> Option<f32> {
+        self.total
+            .map(|total| (self.received as f32 / total as f32).min(1.0))
     }
-    let resp = req.send().await?;
-    if !resp.status().is_success() {
-        let status = resp.status();
-        if status.as_u16() == 401 || status.as_u16() == 403 {
-            bail!("Download denied (HTTP {status}) — this Hugging Face model requires a valid HF Token (click 'HF Token' in the app or set $HF_TOKEN)");
+
+    pub fn label(self) -> String {
+        let received = self.received as f64 / 1_000_000.0;
+        match self.total {
+            Some(total) => format!("{received:.1} of {:.1} MB", total as f64 / 1_000_000.0),
+            None => format!("{received:.1} MB received"),
         }
-        bail!("Download failed (HTTP {status}): {url}");
     }
-    let total = resp.content_length().unwrap_or(0);
+
+    pub fn transfer_label(self) -> String {
+        let mut label = self.label();
+        if self.bytes_per_second > 0 {
+            label.push_str(&format!(
+                " · {:.1} MB/s",
+                self.bytes_per_second as f64 / 1_000_000.0
+            ));
+            if let Some(total) = self.total {
+                let seconds = total
+                    .saturating_sub(self.received)
+                    .div_ceil(self.bytes_per_second);
+                if seconds > 0 {
+                    let remaining = if seconds < 60 {
+                        format!("{seconds}s left")
+                    } else if seconds < 3600 {
+                        format!("{}m left", seconds.div_ceil(60))
+                    } else {
+                        format!("{:.1}h left", seconds as f64 / 3600.0)
+                    };
+                    label.push_str(&format!(" · {remaining}"));
+                }
+            }
+        }
+        label
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallStatus {
+    Checking,
+    DownloadingEngine(DownloadProgress),
+    ExtractingEngine,
+    DownloadingModel(DownloadProgress),
+    Finalizing,
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownloadCommand {
+    Run,
+    Pause,
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownloadOutcome {
+    Complete,
+    Paused,
+    Canceled,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum InstallTarget {
+    Engine(LocalEngineKind),
+    Model(String),
+}
+
+impl InstallTarget {
+    pub fn model_id(&self) -> Option<&str> {
+        match self {
+            Self::Model(id) => Some(id),
+            Self::Engine(_) => None,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Engine(engine) => engine.label(),
+            Self::Model(id) => find_local_whisper_spec(id).map_or(id.as_str(), |spec| spec.name()),
+        }
+    }
+}
+
+impl InstallStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Checking => "Checking requirements",
+            Self::DownloadingEngine(_) => "Downloading the speech engine",
+            Self::ExtractingEngine => "Installing the speech engine",
+            Self::DownloadingModel(_) => "Downloading the speech model",
+            Self::Finalizing => "Finishing setup",
+            Self::Ready => "Ready",
+        }
+    }
+
+    pub fn transfer(self) -> Option<DownloadProgress> {
+        match self {
+            Self::DownloadingEngine(progress) | Self::DownloadingModel(progress) => Some(progress),
+            _ => None,
+        }
+    }
+}
+
+fn download_sidecar(dest: &Path, suffix: &str) -> PathBuf {
+    let mut path = dest.as_os_str().to_owned();
+    path.push(suffix);
+    path.into()
+}
+
+fn lock_download(dest: &Path) -> Result<fs::File> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    let partial = dest.with_extension("part");
-    let mut file = fs::File::create(&partial)?;
-    let mut downloaded = 0u64;
-    let mut stream = resp.bytes_stream();
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(download_sidecar(dest, ".download-lock"))?;
+    file.try_lock()
+        .context("Another process is downloading these files")?;
+    Ok(file)
+}
 
-    while let Some(chunk) = stream.next().await {
+pub fn discard_download(paths: &AppPaths, target: &InstallTarget) -> Result<()> {
+    let Some(model_id) = target.model_id() else {
+        return Ok(());
+    };
+    let spec = find_local_whisper_spec(model_id).context("Unknown speech model")?;
+    let dest = paths.whisper_models_root.join(spec.file);
+    let _lock = lock_download(&dest)?;
+    for suffix in [".part", ".etag"] {
+        match fs::remove_file(download_sidecar(&dest, suffix)) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+fn resumed_total(value: &str, offset: u64) -> Option<u64> {
+    let (range, total) = value.strip_prefix("bytes ")?.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let total = total.parse::<u64>().ok()?;
+    if start.parse::<u64>().ok()? == offset
+        && end.parse::<u64>().ok()?.checked_add(1)? == total
+        && offset < total
+    {
+        Some(total)
+    } else {
+        None
+    }
+}
+
+/// Removes unused partial files for engine archives, including on cancellation.
+struct TemporaryDownload(PathBuf);
+
+impl Drop for TemporaryDownload {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+struct EngineStagingDirectory(PathBuf);
+
+impl Drop for EngineStagingDirectory {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+async fn download_file<F>(
+    url: &str,
+    dest: &Path,
+    bearer_token: Option<&str>,
+    resumable: bool,
+    mut on_progress: F,
+) -> Result<()>
+where
+    F: FnMut(DownloadProgress),
+{
+    let _lock = resumable.then(|| lock_download(dest)).transpose()?;
+    let temporary = (!resumable)
+        .then(|| TemporaryDownload(dest.with_extension(format!("{}.part", uuid::Uuid::new_v4()))));
+    let partial = temporary
+        .as_ref()
+        .map_or_else(|| download_sidecar(dest, ".part"), |file| file.0.clone());
+    let etag_path = download_sidecar(dest, ".etag");
+    let saved_etag = resumable
+        .then(|| fs::read_to_string(&etag_path).ok())
+        .flatten()
+        .filter(|tag| tag.starts_with('"') && tag.ends_with('"'));
+    let mut offset = if saved_etag.is_some() {
+        fs::metadata(&partial).map_or(0, |info| info.len())
+    } else {
+        0
+    };
+    let client = reqwest::Client::builder()
+        .user_agent("AgenteDictate/0.1")
+        .connect_timeout(Duration::from_secs(15))
+        .build()?;
+    let make_request = |offset| {
+        let mut request = client.get(url);
+        if let Some(tok) = bearer_token.filter(|t| !t.trim().is_empty()) {
+            request = request.bearer_auth(tok.trim());
+        }
+        if let Some(tag) = saved_etag.as_ref().filter(|_| offset > 0) {
+            request = request
+                .header(reqwest::header::RANGE, format!("bytes={offset}-"))
+                .header(reqwest::header::IF_RANGE, tag);
+        }
+        request
+    };
+    let send = |request: reqwest::RequestBuilder| async {
+        tokio::time::timeout(Duration::from_secs(60), request.send())
+            .await
+            .context("Timed out waiting for the download to start")?
+            .map_err(anyhow::Error::from)
+    };
+    let mut response = send(make_request(offset)).await?;
+    let mut range_total = None;
+    if offset > 0 {
+        range_total = response
+            .headers()
+            .get(reqwest::header::CONTENT_RANGE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| resumed_total(value, offset))
+            .filter(|_| response.status() == reqwest::StatusCode::PARTIAL_CONTENT)
+            .filter(|_| {
+                response
+                    .headers()
+                    .get(reqwest::header::ETAG)
+                    .is_none_or(|value| value.to_str().ok() == saved_etag.as_deref())
+            });
+        if range_total.is_none() {
+            offset = 0;
+            if matches!(
+                response.status(),
+                reqwest::StatusCode::PARTIAL_CONTENT | reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+            ) {
+                response = send(make_request(0)).await?;
+            }
+        }
+    }
+    let status = response.status();
+    if status.as_u16() == 401 || status.as_u16() == 403 {
+        bail!("Download denied (HTTP {status}). For a gated Hugging Face model, check your Hugging Face token in Settings and verify access to the model.");
+    }
+    if status != reqwest::StatusCode::OK && range_total.is_none() {
+        bail!("Download failed (HTTP {status}): {url}");
+    }
+    let total = range_total.or_else(|| response.content_length().filter(|&size| size > 0));
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if resumable && offset == 0 {
+        // Invalidate the old validator before touching its bytes.
+        match fs::remove_file(&etag_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    let mut file = if offset > 0 {
+        fs::OpenOptions::new().append(true).open(&partial)?
+    } else {
+        fs::File::create(&partial)?
+    };
+    if resumable && offset == 0 {
+        if let Some(tag) = response
+            .headers()
+            .get(reqwest::header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .filter(|tag| tag.starts_with('"') && tag.ends_with('"'))
+        {
+            fs::write(&etag_path, tag)?;
+        }
+    }
+    let mut received = offset;
+    let started = Instant::now();
+    let mut last_report = started;
+    let report = |received, bytes_per_second| DownloadProgress {
+        received,
+        total,
+        bytes_per_second,
+    };
+    on_progress(report(received, 0));
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = tokio::time::timeout(Duration::from_secs(60), stream.next())
+        .await
+        .context("The download stopped receiving data")?
+    {
         let bytes = chunk?;
         file.write_all(&bytes)?;
-        downloaded += bytes.len() as u64;
-        if total > 0 {
-            let pct = ((downloaded as f64 / total as f64) * 100.0).round() as u8;
-            on_progress(pct.min(100));
+        received += bytes.len() as u64;
+        if last_report.elapsed() >= Duration::from_millis(125) {
+            let rate = ((received - offset) as f64 / started.elapsed().as_secs_f64()) as u64;
+            on_progress(report(received, rate));
+            last_report = Instant::now();
         }
+    }
+    if received == 0 || total.is_some_and(|size| received != size) {
+        bail!("The download ended before the full file was received.");
     }
     file.flush()?;
     drop(file);
-    if dest.exists() {
-        let _ = fs::remove_file(dest);
-    }
     fs::rename(&partial, dest)?;
-    on_progress(100);
+    on_progress(report(received, 0));
+    if resumable {
+        let _ = fs::remove_file(etag_path);
+    }
     Ok(())
 }
 
@@ -1310,30 +1626,27 @@ fn extract_archive(archive_path: &Path, dest_dir: &Path) -> Result<()> {
         .unwrap_or("");
 
     if cfg!(windows) || name.ends_with(".zip") {
-        let status = Command::new("tar")
-            .args([
-                "-xf",
-                &archive_path.to_string_lossy(),
-                "-C",
-                &dest_dir.to_string_lossy(),
-            ])
-            .status();
+        let mut tar = Command::new("tar");
+        tar.arg("-xf").arg(archive_path).arg("-C").arg(dest_dir);
+        hide_console_window(&mut tar);
+        let status = tar.status();
         if status.is_ok_and(|s| s.success()) {
             return Ok(());
         }
         // Fallback to PowerShell Expand-Archive on Windows if system tar failed
-        let ps = Command::new("powershell")
+        let mut powershell = Command::new("powershell");
+        powershell
+            .env("ZOV_ENGINE_ARCHIVE", archive_path)
+            .env("ZOV_ENGINE_DESTINATION", dest_dir)
             .args([
                 "-NoProfile",
                 "-Command",
-                &format!(
-                    "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-                    archive_path.display(),
-                    dest_dir.display()
-                ),
-            ])
+                "Expand-Archive -LiteralPath $env:ZOV_ENGINE_ARCHIVE -DestinationPath $env:ZOV_ENGINE_DESTINATION -Force",
+            ]);
+        hide_console_window(&mut powershell);
+        let ps = powershell
             .status()
-            .context("Failed to extract whisper.cpp archive")?;
+            .context("Failed to extract the speech engine archive")?;
         if !ps.success() {
             bail!("Expand-Archive failed for {}", archive_path.display());
         }
@@ -1354,127 +1667,377 @@ fn extract_archive(archive_path: &Path, dest_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Download the required local engine (`whisper.cpp` or `audio.cpp` for non-Whisper GGUF)
-/// and the requested Hugging Face model (using `hf_token` if configured).
+/// Install an engine or model with the same progress and cancellation controls.
+pub async fn install_controlled<F>(
+    paths: &AppPaths,
+    cfg: &DictateConfig,
+    target: &InstallTarget,
+    mut commands: tokio::sync::watch::Receiver<DownloadCommand>,
+    on_status: F,
+) -> Result<DownloadOutcome>
+where
+    F: FnMut(InstallStatus),
+{
+    let stop = async {
+        loop {
+            let command = *commands.borrow_and_update();
+            if command != DownloadCommand::Run {
+                return command;
+            }
+            if commands.changed().await.is_err() {
+                return DownloadCommand::Pause;
+            }
+        }
+    };
+    let command = tokio::select! {
+        biased;
+        command = stop => command,
+        result = install(paths, cfg, target, on_status) => {
+            return result.map(|()| DownloadOutcome::Complete);
+        }
+    };
+    if command == DownloadCommand::Pause {
+        Ok(DownloadOutcome::Paused)
+    } else {
+        discard_download(paths, target)?;
+        Ok(DownloadOutcome::Canceled)
+    }
+}
+
 pub async fn setup_local_whisper<F>(
     paths: &AppPaths,
     cfg: &DictateConfig,
     model_id: &str,
+    on_status: F,
+) -> Result<()>
+where
+    F: FnMut(InstallStatus),
+{
+    install(
+        paths,
+        cfg,
+        &InstallTarget::Model(model_id.to_owned()),
+        on_status,
+    )
+    .await
+}
+
+async fn install<F>(
+    paths: &AppPaths,
+    cfg: &DictateConfig,
+    target: &InstallTarget,
     mut on_status: F,
 ) -> Result<()>
 where
-    F: FnMut(String, u8),
+    F: FnMut(InstallStatus),
 {
-    let spec = find_local_whisper_spec(model_id)
-        .with_context(|| format!("Unknown local model '{model_id}'"))?;
-
-    match spec.engine {
-        LocalEngineKind::WhisperCpp => {
-            if resolve_whisper_binary(paths, cfg).is_none() {
-                on_status("Finding official whisper.cpp release…".to_string(), 2);
-                let client = reqwest::Client::builder()
-                    .user_agent("AgenteDictate/0.1")
-                    .build()?;
-                let releases: Vec<Value> = client.get(RELEASES_URL).send().await?.json().await?;
-                let mut chosen = None;
-                for rel in &releases {
-                    if let Some(assets) = rel.get("assets").and_then(Value::as_array) {
-                        if let Some((name, url)) = select_whisper_asset(assets) {
-                            let tag = rel
-                                .get("tag_name")
-                                .and_then(Value::as_str)
-                                .unwrap_or("latest");
-                            chosen = Some((tag.to_string(), name, url));
-                            break;
-                        }
-                    }
-                }
-                let (tag, asset_name, asset_url) = chosen
-                    .context("No prebuilt whisper.cpp binary found for this OS/architecture")?;
-
-                let archive_path = paths.cache_root.join(&asset_name);
-                download_with_progress(&asset_url, &archive_path, None, |pct| {
-                    on_status(
-                        format!("Downloading whisper.cpp {tag} ({pct}%)…"),
-                        pct / 5,
-                    );
-                })
-                .await?;
-
-                on_status("Extracting whisper.cpp engine…".to_string(), 22);
-                let dest_dir = paths.whisper_bin_root.join(&tag);
-                extract_archive(&archive_path, &dest_dir)?;
-                let _ = fs::remove_file(&archive_path);
-            }
+    on_status(InstallStatus::Checking);
+    match target {
+        InstallTarget::Engine(engine) => {
+            ensure_speech_engine(paths, cfg, *engine, &mut on_status).await?;
+            on_status(InstallStatus::Finalizing);
         }
-        LocalEngineKind::AudioCpp => {
-            if resolve_audiocpp_binary(paths).is_none() {
-                on_status("Finding official audio.cpp release (non-Whisper engine)…".to_string(), 2);
-                let client = reqwest::Client::builder()
-                    .user_agent("AgenteDictate/0.1")
-                    .build()?;
-                let releases: Vec<Value> = client
-                    .get(AUDIOCPP_RELEASES_URL)
-                    .send()
-                    .await?
-                    .json()
-                    .await?;
-                let mut chosen = None;
-                for rel in &releases {
-                    if let Some(assets) = rel.get("assets").and_then(Value::as_array) {
-                        if let Some((name, url)) = select_audiocpp_asset(assets) {
-                            let tag = rel
-                                .get("tag_name")
-                                .and_then(Value::as_str)
-                                .unwrap_or("latest");
-                            chosen = Some((tag.to_string(), name, url));
-                            break;
-                        }
-                    }
-                }
-                let (tag, asset_name, asset_url) = chosen
-                    .context("No prebuilt audio.cpp binary found for this OS/architecture")?;
-
-                let archive_path = paths.cache_root.join(&asset_name);
-                download_with_progress(&asset_url, &archive_path, None, |pct| {
-                    on_status(format!("Downloading audio.cpp {tag} ({pct}%)…"), pct / 5);
+        InstallTarget::Model(model_id) => {
+            let spec = find_local_whisper_spec(model_id)
+                .with_context(|| format!("Unknown local model '{model_id}'"))?;
+            ensure_speech_engine(paths, cfg, spec.engine, &mut on_status).await?;
+            if check_local_whisper_model(paths, spec.id).is_none() {
+                let destination = paths.whisper_models_root.join(spec.file);
+                let token = cfg.resolve_hf_token();
+                let bearer = (!token.is_empty()).then_some(token.as_str());
+                download_file(spec.url, &destination, bearer, true, |progress| {
+                    on_status(InstallStatus::DownloadingModel(progress));
                 })
                 .await?;
-
-                on_status("Extracting audio.cpp engine…".to_string(), 22);
-                let dest_dir = paths.audio_bin_root.join("cpu");
-                extract_archive(&archive_path, &dest_dir)?;
-                let _ = fs::remove_file(&archive_path);
+            }
+            on_status(InstallStatus::Finalizing);
+            if check_local_whisper_model(paths, spec.id).is_none() {
+                bail!("The installed model could not be found. Check where it was downloaded, then retry.");
             }
         }
     }
+    on_status(InstallStatus::Ready);
+    Ok(())
+}
 
-    if check_local_whisper_model(paths, spec.id).is_none() {
-        let target = paths.whisper_models_root.join(spec.file);
-        let hf_tok = cfg.resolve_hf_token();
-        let bearer = if hf_tok.is_empty() {
-            None
-        } else {
-            Some(hf_tok.as_str())
-        };
-        download_with_progress(spec.url, &target, bearer, |pct| {
-            let overall = 25 + (u16::from(pct) * 75 / 100) as u8;
-            on_status(
-                format!("Downloading {} ({} MB · {pct}%)…", spec.id, spec.size_mb),
-                overall,
-            );
-        })
+async fn ensure_speech_engine(
+    paths: &AppPaths,
+    cfg: &DictateConfig,
+    engine: LocalEngineKind,
+    on_status: &mut impl FnMut(InstallStatus),
+) -> Result<()> {
+    if resolve_speech_engine(paths, cfg, engine).is_some() {
+        return Ok(());
+    }
+    let _lock = lock_download(&paths.cache_root.join(engine.label()))?;
+    if resolve_speech_engine(paths, cfg, engine).is_some() {
+        return Ok(());
+    }
+    let releases_url = match engine {
+        LocalEngineKind::WhisperCpp => RELEASES_URL,
+        LocalEngineKind::AudioCpp => AUDIOCPP_RELEASES_URL,
+    };
+    let client = reqwest::Client::builder()
+        .user_agent("AgenteDictate/0.1")
+        .timeout(Duration::from_secs(30))
+        .build()?;
+    let releases: Vec<Value> = client
+        .get(releases_url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
         .await?;
-    }
+    let (tag, asset_name, asset_url) = releases
+        .iter()
+        .find_map(|release| {
+            let assets = release.get("assets")?.as_array()?;
+            let (name, url) = match engine {
+                LocalEngineKind::WhisperCpp => select_whisper_asset(assets)?,
+                LocalEngineKind::AudioCpp => select_audiocpp_asset(assets)?,
+            };
+            let tag = release
+                .get("tag_name")
+                .and_then(Value::as_str)
+                .unwrap_or("latest");
+            Some((tag, name, url))
+        })
+        .with_context(|| {
+            format!(
+                "No prebuilt {} binary found for this OS or architecture",
+                engine.label()
+            )
+        })?;
 
-    stop_whisper_server();
-    on_status(format!("Ready · {}", spec.label), 100);
+    let archive = TemporaryDownload(paths.cache_root.join(asset_name));
+    download_file(&asset_url, &archive.0, None, false, |progress| {
+        on_status(InstallStatus::DownloadingEngine(progress));
+    })
+    .await?;
+
+    on_status(InstallStatus::ExtractingEngine);
+    let destination = match engine {
+        LocalEngineKind::WhisperCpp => paths.whisper_bin_root.join(tag),
+        LocalEngineKind::AudioCpp => paths.audio_bin_root.join("cpu"),
+    };
+    let destination = if destination.exists() {
+        download_sidecar(&destination, &format!("-{}", uuid::Uuid::new_v4()))
+    } else {
+        destination
+    };
+    let staging_path = paths
+        .cache_root
+        .join(format!("engine-unpack-{}", uuid::Uuid::new_v4()));
+    fs::create_dir(&staging_path)?;
+    let staging = EngineStagingDirectory(staging_path);
+    extract_archive(&archive.0, &staging.0)?;
+    let binary_names = match engine {
+        LocalEngineKind::WhisperCpp => WHISPER_CLI_NAMES,
+        LocalEngineKind::AudioCpp => &[AUDIOCPP_SERVER_NAME],
+    };
+    let binary = find_binary_in_dir(&staging.0, binary_names).with_context(|| {
+        format!(
+            "The archive did not contain a {} executable.",
+            engine.label()
+        )
+    })?;
+    if binary.strip_prefix(&staging.0)?.components().count() > 3 {
+        bail!(
+            "The {} archive has an unsupported folder layout.",
+            engine.label()
+        );
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(&staging.0, &destination)
+        .context("Could not publish the installed speech engine")?;
+    if resolve_speech_engine(paths, cfg, engine).is_none() {
+        bail!(
+            "Setup finished but the {} executable could not be found.",
+            engine.label()
+        );
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    async fn serve_download(
+        response: &'static [u8],
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (headers_tx, headers_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            let mut line = String::new();
+            let mut headers = String::new();
+            loop {
+                line.clear();
+                if stream.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+                headers.push_str(&line);
+            }
+            let _ = headers_tx.send(headers);
+            stream.get_mut().write_all(response).await.unwrap();
+            stream.get_mut().shutdown().await.unwrap();
+        });
+        (format!("http://{addr}/model"), headers_rx)
+    }
+
+    #[tokio::test]
+    async fn reports_bytes_when_the_server_does_not_send_a_total() {
+        let (url, _) = serve_download(
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nmodel\r\n0\r\n\r\n",
+        ).await;
+        let dir = std::env::temp_dir().join(format!("zov-download-{}", uuid::Uuid::new_v4()));
+        let target = dir.join("model.bin");
+        let mut reports = Vec::new();
+        let result = download_file(&url, &target, None, false, |progress| {
+            reports.push(progress)
+        })
+        .await;
+        let saved = fs::read(&target);
+        let _ = fs::remove_file(&target);
+        let _ = fs::remove_dir(&dir);
+
+        result.unwrap();
+        assert_eq!(saved.unwrap(), b"model");
+        assert_eq!(reports.first().unwrap().received, 0);
+        assert_eq!(reports.last().unwrap().received, 5);
+        assert_eq!(reports.last().unwrap().fraction(), None);
+    }
+
+    #[tokio::test]
+    async fn failed_download_keeps_the_existing_file_and_cleans_up_the_partial() {
+        let (url, _) = serve_download(
+            b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 100\r\n\r\nincomplete",
+        )
+        .await;
+        let dir = std::env::temp_dir().join(format!("zov-download-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let target = dir.join("model.bin");
+        fs::write(&target, b"existing model").unwrap();
+
+        let result = download_file(&url, &target, None, false, |_| {}).await;
+        let saved = fs::read(&target).unwrap();
+        fs::remove_file(&target).unwrap();
+        let cleanup = fs::remove_dir(&dir);
+
+        assert!(result.is_err());
+        assert_eq!(saved, b"existing model");
+        cleanup.unwrap();
+    }
+
+    #[tokio::test]
+    async fn model_download_resumes_only_for_matching_ranges() {
+        for (response, expected) in [
+            (b"HTTP/1.1 206 Partial Content\r\nConnection: close\r\nContent-Length: 3\r\nContent-Range: bytes 2-4/5\r\nETag: \"v1\"\r\n\r\ndel".as_slice(), b"model".as_slice()),
+            (b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\nETag: \"v2\"\r\n\r\nfresh".as_slice(), b"fresh".as_slice()),
+        ] {
+            let (url, headers) = serve_download(response).await;
+            let dir = std::env::temp_dir().join(format!("zov-resume-{}", uuid::Uuid::new_v4()));
+            fs::create_dir(&dir).unwrap();
+            let target = dir.join("model.bin");
+            fs::write(download_sidecar(&target, ".part"), b"mo").unwrap();
+            fs::write(download_sidecar(&target, ".etag"), "\"v1\"").unwrap();
+            let mut reports = Vec::new();
+            let result = download_file(&url, &target, None, true, |progress| reports.push(progress)).await;
+            let saved = fs::read(&target);
+            let _ = fs::remove_file(&target);
+            fs::remove_file(download_sidecar(&target, ".download-lock")).unwrap();
+            let cleanup = fs::remove_dir(&dir);
+
+            result.unwrap();
+            assert_eq!(saved.unwrap(), expected);
+            assert_eq!(reports.last().unwrap().fraction(), Some(1.0));
+            let headers = headers.await.unwrap().to_ascii_lowercase();
+            assert!(headers.contains("range: bytes=2-"));
+            assert!(headers.contains("if-range: \"v1\""));
+            cleanup.unwrap();
+        }
+    }
+
+    #[test]
+    fn range_response_must_cover_the_remaining_file_exactly() {
+        assert_eq!(resumed_total("bytes 2-4/5", 2), Some(5));
+        assert_eq!(resumed_total("bytes 1-4/5", 2), None);
+        assert_eq!(resumed_total("bytes 2-3/5", 2), None);
+        assert_eq!(resumed_total("bytes 2-4/*", 2), None);
+    }
+
+    #[test]
+    fn cancel_discards_the_partial_without_deleting_the_installed_model() {
+        let dir = std::env::temp_dir().join(format!("zov-cancel-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&dir).unwrap();
+        let mut paths = AppPaths::resolve();
+        paths.whisper_models_root = dir.clone();
+        let spec = find_local_whisper_spec("small_q5").unwrap();
+        let target = dir.join(spec.file);
+        fs::write(&target, b"installed").unwrap();
+        let partial = download_sidecar(&target, ".part");
+        let validator = download_sidecar(&target, ".etag");
+        fs::write(&partial, b"partial").unwrap();
+        fs::write(&validator, "\"v1\"").unwrap();
+
+        discard_download(&paths, &InstallTarget::Model(spec.id.into())).unwrap();
+
+        assert!(!partial.exists());
+        assert!(!validator.exists());
+        assert_eq!(fs::read(&target).unwrap(), b"installed");
+        fs::remove_file(&target).unwrap();
+        fs::remove_file(download_sidecar(&target, ".download-lock")).unwrap();
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn engine_only_setup_reuses_a_runtime_without_creating_a_model_directory() {
+        let dir = std::env::temp_dir().join(format!("zov-engine-{}", uuid::Uuid::new_v4()));
+        let runtime_dir = dir.join("runtime");
+        fs::create_dir_all(&runtime_dir).unwrap();
+        let binary = runtime_dir.join(AUDIOCPP_SERVER_NAME);
+        fs::write(&binary, b"test executable").unwrap();
+        let mut paths = AppPaths::resolve();
+        paths.shared_audio_bin_roots = vec![runtime_dir.clone()];
+        paths.whisper_models_root = dir.join("models");
+        paths.cache_root = dir.join("cache");
+        let target = InstallTarget::Engine(LocalEngineKind::AudioCpp);
+        let (_command, commands) = tokio::sync::watch::channel(DownloadCommand::Run);
+        let mut progress = Vec::new();
+
+        let result = install_controlled(
+            &paths,
+            &DictateConfig::default(),
+            &target,
+            commands,
+            |stage| {
+                progress.push(stage);
+            },
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), DownloadOutcome::Complete);
+        assert_eq!(
+            progress,
+            [
+                InstallStatus::Checking,
+                InstallStatus::Finalizing,
+                InstallStatus::Ready
+            ]
+        );
+        assert!(!paths.whisper_models_root.exists());
+        assert!(!paths.cache_root.exists());
+        fs::remove_file(binary).unwrap();
+        fs::remove_dir(runtime_dir).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn parses_whisper_cli_timestamps_and_strips_diagnostics() {

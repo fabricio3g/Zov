@@ -4,6 +4,7 @@
 //! waveform capsule, circle, and shaped glyph is rendered in a single instanced GPU draw call
 //! (< 0.3 ms/frame, HiDPI-sharp at any Windows display scale).
 
+use crate::icon_motion::{tracks, Layer, Pose, CENTER};
 use crate::style::Rgba;
 use anyhow::{Context, Result};
 use bytemuck::{Pod, Zeroable};
@@ -11,11 +12,14 @@ use cosmic_text::{
     Attrs, Buffer as TextBuffer, CacheKey, Family, FontSystem as CosmicFontSystem, Metrics,
     Shaping, SwashCache, Weight, Wrap,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 use std::sync::Arc;
 use winit::window::Window;
 
 const ATLAS_SIZE: u32 = 2048;
+const MAX_TEXT_LAYOUTS: usize = 512;
+const MAX_CACHED_TEXT_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum IconId {
@@ -25,8 +29,12 @@ pub enum IconId {
     Cpu,
     Settings,
     Copy,
+    Download,
+    Loader,
+    Pause,
+    Play,
+    Check,
     Trash,
-    Globe,
     Sun,
     Moon,
     Close,
@@ -40,14 +48,18 @@ pub enum IconId {
 impl IconId {
     fn svg_source(self) -> &'static str {
         match self {
-            Self::Brand => include_str!("../assets/icons/brand.svg"),
+            Self::Brand => include_str!("../assets/icons/enio/unframed/icon-waveform-white.svg"),
             Self::Mic => include_str!("../assets/icons/mic.svg"),
             Self::Square => include_str!("../assets/icons/square.svg"),
             Self::Cpu => include_str!("../assets/icons/cpu.svg"),
             Self::Settings => include_str!("../assets/icons/settings.svg"),
             Self::Copy => include_str!("../assets/icons/copy.svg"),
+            Self::Download => include_str!("../assets/icons/download.svg"),
+            Self::Loader => include_str!("../assets/icons/loader-circle.svg"),
+            Self::Pause => include_str!("../assets/icons/pause.svg"),
+            Self::Play => include_str!("../assets/icons/play.svg"),
+            Self::Check => include_str!("../assets/icons/check.svg"),
             Self::Trash => include_str!("../assets/icons/trash-2.svg"),
-            Self::Globe => include_str!("../assets/icons/globe.svg"),
             Self::Sun => include_str!("../assets/icons/sun-medium.svg"),
             Self::Moon => include_str!("../assets/icons/moon-star.svg"),
             Self::Close => include_str!("../assets/icons/x.svg"),
@@ -57,6 +69,28 @@ impl IconId {
             Self::Refresh => include_str!("../assets/icons/refresh-cw.svg"),
             Self::Sliders => include_str!("../assets/icons/sliders.svg"),
         }
+    }
+
+    fn layer_source(self, layer: Layer) -> Option<String> {
+        let source = self.svg_source();
+        if layer == Layer::Whole {
+            return Some(source.replace("currentColor", "#ffffff"));
+        }
+        let mut lines = source.lines();
+        let root = lines.next()?;
+        let shapes = lines
+            .filter(|line| {
+                let shape = line.trim_start();
+                (shape.starts_with("<path ")
+                    || shape.starts_with("<circle ")
+                    || shape.starts_with("<rect "))
+                    && layer.includes(shape)
+            })
+            .collect::<Vec<_>>();
+        if shapes.is_empty() {
+            return None;
+        }
+        Some(format!("{root}\n{}\n</svg>", shapes.join("\n")).replace("currentColor", "#ffffff"))
     }
 }
 
@@ -98,7 +132,7 @@ pub struct QuadInstance {
     pub border_color: [f32; 4],
     /// `[u0, v0, u1, v1]` in the glyph atlas when `kind == 1`.
     pub uv_rect: [f32; 4],
-    /// `[radius_px, border_width_px, kind (0=rect, 1=glyph), 0.0]`.
+    /// `[radius_px, border_or_blur_px, kind (0=rect, 1=glyph, 2=shadow), rotation_radians]`.
     pub params: [f32; 4],
 }
 
@@ -142,7 +176,14 @@ fn vs_main(@builtin(vertex_index) vid: u32, inst: Instance) -> VertexOut {
         vec2<f32>(0.0, 1.0),
     );
     let c = corners[vid];
-    let px = inst.pos + c * inst.size;
+    var px = inst.pos + c * inst.size;
+    if (inst.params.w != 0.0) {
+        let local = (c - vec2<f32>(0.5)) * inst.size;
+        let sine = sin(inst.params.w);
+        let cosine = cos(inst.params.w);
+        let rotated = vec2<f32>(local.x * cosine - local.y * sine, local.x * sine + local.y * cosine);
+        px = inst.pos + inst.size * 0.5 + rotated;
+    }
     let ndc = vec2<f32>(
         (px.x / u.screen_size.x) * 2.0 - 1.0,
         1.0 - (px.y / u.screen_size.y) * 2.0,
@@ -167,6 +208,15 @@ fn sdf_rounded_box(p: vec2<f32>, half_size: vec2<f32>, r: f32) -> f32 {
 @fragment
 fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     let kind = in.params.z;
+    if (kind > 1.5) {
+        let blur = in.params.y;
+        let half_size = in.size * 0.5 - vec2<f32>(blur * 2.5);
+        let p = in.local_pos - in.size * 0.5;
+        let radius = min(in.params.x, min(half_size.x, half_size.y));
+        let distance = max(0.0, sdf_rounded_box(p, half_size, radius)) / blur;
+        let coverage = exp(-0.5 * distance * distance) * (1.0 - smoothstep(2.0, 2.5, distance));
+        return vec4<f32>(in.color.rgb, in.color.a * coverage);
+    }
     if (kind > 0.5) {
         // Crisp glyph from R8 atlas
         let cov = textureSample(glyph_tex, glyph_samp, in.uv).r;
@@ -219,11 +269,19 @@ struct PendingGlyphUpload {
     data: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FontWeight {
     Regular,
     Semibold,
     Bold,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct LayoutKey {
+    font_size: u32,
+    line_height: u32,
+    width: Option<u32>,
+    weight: FontWeight,
 }
 
 impl FontWeight {
@@ -242,7 +300,10 @@ pub struct TextEngine {
     pub ui_family: Option<&'static str>,
     swash: SwashCache,
     glyphs: HashMap<CacheKey, Option<CachedGlyph>>,
-    icons: HashMap<(IconId, u32), Option<[f32; 4]>>,
+    icons: HashMap<(IconId, Layer, u32), Option<[f32; 4]>>,
+    layouts: HashMap<LayoutKey, HashMap<Rc<str>, Rc<TextBuffer>>>,
+    layout_order: VecDeque<(LayoutKey, Rc<str>)>,
+    cache_layouts: bool,
     cursor_x: u32,
     cursor_y: u32,
     row_height: u32,
@@ -299,17 +360,95 @@ impl TextEngine {
             font_system.db_mut().set_sans_serif_family(fam);
         }
 
+        Self::with_font_system(font_system, ui_family)
+    }
+
+    pub fn for_other_window(&self) -> Self {
+        let fonts = CosmicFontSystem::new_with_locale_and_db(
+            self.font_system.locale().to_owned(),
+            self.font_system.db().clone(),
+        );
+        Self::with_font_system(fonts, self.ui_family)
+    }
+
+    fn with_font_system(font_system: CosmicFontSystem, ui_family: Option<&'static str>) -> Self {
         Self {
             font_system,
             ui_family,
             swash: SwashCache::new(),
             glyphs: HashMap::with_capacity(512),
             icons: HashMap::with_capacity(64),
+            layouts: HashMap::new(),
+            layout_order: VecDeque::new(),
+            cache_layouts: true,
             cursor_x: 1,
             cursor_y: 1,
             row_height: 0,
             pending_uploads: Vec::new(),
         }
+    }
+
+    pub fn clear_layouts(&mut self) {
+        self.layouts.clear();
+        self.layout_order.clear();
+    }
+
+    pub fn with_uncached_layouts(&mut self, draw: impl FnOnce(&mut Self)) {
+        let previous = self.cache_layouts;
+        self.cache_layouts = false;
+        draw(self);
+        self.cache_layouts = previous;
+    }
+
+    fn layout(
+        &mut self,
+        text: &str,
+        size: f32,
+        line_height: f32,
+        weight: FontWeight,
+        width: Option<f32>,
+    ) -> Rc<TextBuffer> {
+        let cache = self.cache_layouts && text.len() <= MAX_CACHED_TEXT_BYTES;
+        let key = LayoutKey {
+            font_size: size.to_bits(),
+            line_height: line_height.to_bits(),
+            width: width.map(f32::to_bits),
+            weight,
+        };
+        if cache {
+            if let Some(layout) = self.layouts.get(&key).and_then(|group| group.get(text)) {
+                return Rc::clone(layout);
+            }
+        }
+
+        let attrs = Self::ui_attrs(self.ui_family, weight);
+        let mut buffer = TextBuffer::new(&mut self.font_system, Metrics::new(size, line_height));
+        if let Some(width) = width {
+            buffer.set_wrap(Wrap::WordOrGlyph);
+            buffer.set_size(Some(width), None);
+        }
+        buffer.set_text(text, &attrs, Shaping::Advanced, None);
+        buffer.shape_until_scroll(&mut self.font_system, false);
+        let layout = Rc::new(buffer);
+        if cache {
+            if self.layout_order.len() == MAX_TEXT_LAYOUTS {
+                if let Some((old_key, old_text)) = self.layout_order.pop_front() {
+                    if let Some(group) = self.layouts.get_mut(&old_key) {
+                        group.remove(&old_text);
+                        if group.is_empty() {
+                            self.layouts.remove(&old_key);
+                        }
+                    }
+                }
+            }
+            let saved_text = Rc::<str>::from(text);
+            self.layouts
+                .entry(key)
+                .or_default()
+                .insert(Rc::clone(&saved_text), Rc::clone(&layout));
+            self.layout_order.push_back((key, saved_text));
+        }
+        layout
     }
 
     fn ui_attrs(ui_family: Option<&'static str>, weight: FontWeight) -> Attrs<'static> {
@@ -353,19 +492,23 @@ impl TextEngine {
         ]
     }
 
-    fn get_or_cache_icon(&mut self, icon: IconId, phys_px: u32) -> Option<[f32; 4]> {
+    fn get_or_cache_icon(&mut self, icon: IconId, layer: Layer, phys_px: u32) -> Option<[f32; 4]> {
         let size = phys_px.clamp(8, 128);
-        if let Some(&cached) = self.icons.get(&(icon, size)) {
+        let key = (icon, layer, size);
+        if let Some(&cached) = self.icons.get(&key) {
             return cached;
         }
-        let svg_raw = icon.svg_source().replace("currentColor", "#ffffff");
+        let Some(svg_raw) = icon.layer_source(layer) else {
+            self.icons.insert(key, None);
+            return None;
+        };
         let opt = resvg::usvg::Options::default();
         let Ok(tree) = resvg::usvg::Tree::from_str(&svg_raw, &opt) else {
-            self.icons.insert((icon, size), None);
+            self.icons.insert(key, None);
             return None;
         };
         let Some(mut pixmap) = resvg::tiny_skia::Pixmap::new(size, size) else {
-            self.icons.insert((icon, size), None);
+            self.icons.insert(key, None);
             return None;
         };
         let sx = size as f32 / tree.size().width();
@@ -377,7 +520,7 @@ impl TextEngine {
         );
         let alpha_mask: Vec<u8> = pixmap.data().chunks_exact(4).map(|px| px[3]).collect();
         let uv = self.alloc_atlas_slot(size, size, alpha_mask);
-        self.icons.insert((icon, size), Some(uv));
+        self.icons.insert(key, Some(uv));
         Some(uv)
     }
 
@@ -419,12 +562,8 @@ impl TextEngine {
     }
 
     pub fn measure(&mut self, text: &str, size: f32, weight: FontWeight) -> f32 {
-        let metrics = Metrics::new(size, size * 1.25);
-        let attrs = Self::ui_attrs(self.ui_family, weight);
-        let mut buf = TextBuffer::new(&mut self.font_system, metrics);
-        buf.set_text(text, &attrs, Shaping::Advanced, None);
-        buf.shape_until_scroll(&mut self.font_system, false);
-        buf.layout_runs()
+        self.layout(text, size, size * 1.25, weight, None)
+            .layout_runs()
             .map(|run| run.line_w)
             .fold(0.0_f32, f32::max)
     }
@@ -437,15 +576,17 @@ impl TextEngine {
         max_width: f32,
         max_lines: usize,
     ) -> usize {
-        let line_h = size * 1.45;
-        let metrics = Metrics::new(size, line_h);
-        let attrs = Self::ui_attrs(self.ui_family, FontWeight::Regular);
-        let mut buf = TextBuffer::new(&mut self.font_system, metrics);
-        buf.set_wrap(Wrap::WordOrGlyph);
-        buf.set_size(Some(max_width.max(40.0)), None);
-        buf.set_text(text, &attrs, Shaping::Advanced, None);
-        buf.shape_until_scroll(&mut self.font_system, false);
-        buf.layout_runs().count().clamp(1, max_lines)
+        self.layout(
+            text,
+            size,
+            size * 1.45,
+            FontWeight::Regular,
+            Some(max_width.max(40.0)),
+        )
+        .layout_runs()
+        .take(max_lines)
+        .count()
+        .max(1)
     }
 }
 
@@ -453,6 +594,7 @@ impl TextEngine {
 pub struct DrawList {
     pub scale: f32,
     pub instances: Vec<QuadInstance>,
+    clipped_instances: Option<(u32, u32, Rect)>,
 }
 
 impl DrawList {
@@ -460,16 +602,44 @@ impl DrawList {
         Self {
             scale: scale.max(1.0),
             instances: Vec::with_capacity(512),
+            clipped_instances: None,
         }
     }
 
     pub fn clear(&mut self, scale: f32) {
         self.scale = scale.max(1.0);
         self.instances.clear();
+        self.clipped_instances = None;
+    }
+
+    pub fn clip_instances_from(&mut self, first: usize, rect: Rect) {
+        self.clipped_instances = Some((first as u32, self.instances.len() as u32, rect));
+    }
+
+    pub fn fade_from(&mut self, first: usize, opacity: f32) {
+        if opacity < 1.0 {
+            for instance in &mut self.instances[first..] {
+                instance.color[3] *= opacity;
+                instance.border_color[3] *= opacity;
+            }
+        }
     }
 
     pub fn fill_rect(&mut self, rect: Rect, radius: f32, color: Rgba) {
         self.fill_rect_bordered(rect, radius, color, 0.0, Rgba::transparent());
+    }
+
+    pub fn drop_shadow(&mut self, rect: Rect, radius: f32, blur: f32, offset_y: f32, color: Rgba) {
+        let pad = blur * 2.5;
+        let scale = self.scale;
+        self.instances.push(QuadInstance {
+            pos: [(rect.x - pad) * scale, (rect.y + offset_y - pad) * scale],
+            size: [(rect.w + 2.0 * pad) * scale, (rect.h + 2.0 * pad) * scale],
+            color: color.to_f32(),
+            border_color: [0.0; 4],
+            uv_rect: [0.0; 4],
+            params: [radius * scale, blur * scale, 2.0, 0.0],
+        });
     }
 
     pub fn fill_rect_bordered(
@@ -502,7 +672,7 @@ impl DrawList {
         );
     }
 
-    /// Draw an Electron SVG icon from `assets/icons/` cached at native HiDPI in the GPU atlas.
+    /// Draw an SVG icon from the GPU atlas.
     pub fn draw_icon(
         &mut self,
         text_engine: &mut TextEngine,
@@ -512,16 +682,125 @@ impl DrawList {
         size: f32,
         color: Rgba,
     ) {
+        self.draw_icon_layer(
+            text_engine,
+            icon,
+            [x, y],
+            size,
+            color,
+            Layer::Whole,
+            CENTER,
+            Pose::STILL,
+        );
+    }
+
+    pub fn draw_animated_icon(
+        &mut self,
+        text_engine: &mut TextEngine,
+        icon: IconId,
+        rect: Rect,
+        size: f32,
+        color: Rgba,
+        elapsed_ms: f32,
+    ) {
+        let top_left = [
+            rect.x + (rect.w - size) * 0.5,
+            rect.y + (rect.h - size) * 0.5,
+        ];
+        let tracks = tracks(icon);
+        if !tracks.iter().any(|track| track.is_active(elapsed_ms)) {
+            self.draw_icon(text_engine, icon, top_left[0], top_left[1], size, color);
+            return;
+        }
+        if tracks[0].layer != Layer::Whole {
+            self.draw_icon_layer(
+                text_engine,
+                icon,
+                top_left,
+                size,
+                color,
+                Layer::Base,
+                CENTER,
+                Pose::STILL,
+            );
+        }
+        for track in tracks {
+            self.draw_icon_layer(
+                text_engine,
+                icon,
+                top_left,
+                size,
+                color,
+                track.layer,
+                track.pivot,
+                track.sample(elapsed_ms),
+            );
+        }
+    }
+
+    pub fn draw_rotating_icon(
+        &mut self,
+        text_engine: &mut TextEngine,
+        icon: IconId,
+        rect: Rect,
+        size: f32,
+        color: Rgba,
+        degrees: f32,
+    ) {
+        let top_left = [
+            rect.x + (rect.w - size) * 0.5,
+            rect.y + (rect.h - size) * 0.5,
+        ];
+        self.draw_icon_layer(
+            text_engine,
+            icon,
+            top_left,
+            size,
+            color,
+            Layer::Whole,
+            CENTER,
+            Pose::rotate(degrees),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_icon_layer(
+        &mut self,
+        text_engine: &mut TextEngine,
+        icon: IconId,
+        top_left: [f32; 2],
+        size: f32,
+        color: Rgba,
+        layer: Layer,
+        pivot: [f32; 2],
+        pose: Pose,
+    ) {
         let s = self.scale;
         let phys_px = (size * s).round().max(8.0) as u32;
-        if let Some(uv_rect) = text_engine.get_or_cache_icon(icon, phys_px) {
+        if let Some(uv_rect) = text_engine.get_or_cache_icon(icon, layer, phys_px) {
+            let unit = phys_px as f32 / 16.0;
+            let scaled = std::array::from_fn(|axis| phys_px as f32 * pose.scale[axis]);
+            let relative: [f32; 2] =
+                std::array::from_fn(|axis| (CENTER[axis] - pivot[axis]) * unit * pose.scale[axis]);
+            let angle = pose.rotation.to_radians();
+            let relative = [
+                relative[0] * angle.cos() - relative[1] * angle.sin(),
+                relative[0] * angle.sin() + relative[1] * angle.cos(),
+            ];
+            let mut tint = color.to_f32();
+            tint[3] *= pose.opacity;
             self.instances.push(QuadInstance {
-                pos: [(x * s).round(), (y * s).round()],
-                size: [phys_px as f32, phys_px as f32],
-                color: color.to_f32(),
+                pos: std::array::from_fn(|axis| {
+                    (top_left[axis] * s).round()
+                        + (pivot[axis] + pose.offset[axis]) * unit
+                        + relative[axis]
+                        - scaled[axis] * 0.5
+                }),
+                size: scaled,
+                color: tint,
                 border_color: [0.0; 4],
                 uv_rect,
-                params: [0.0, 0.0, 1.0, 0.0],
+                params: [0.0, 0.0, 1.0, angle],
             });
         }
     }
@@ -540,32 +819,51 @@ impl DrawList {
         max_lines: usize,
         text: &str,
     ) -> f32 {
+        self.draw_text_lines(
+            text_engine,
+            x,
+            y,
+            size,
+            color,
+            weight,
+            max_width,
+            0,
+            max_lines,
+            text,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_text_lines(
+        &mut self,
+        text_engine: &mut TextEngine,
+        x: f32,
+        y: f32,
+        size: f32,
+        color: Rgba,
+        weight: FontWeight,
+        max_width: Option<f32>,
+        first_line: usize,
+        max_lines: usize,
+        text: &str,
+    ) -> f32 {
         let s = self.scale;
         let phys_size = size * s;
         let line_mult = if max_lines > 1 { 1.45 } else { 1.25 };
         let phys_line_h = phys_size * line_mult;
-        let metrics = Metrics::new(phys_size, phys_line_h);
-        let attrs = TextEngine::ui_attrs(text_engine.ui_family, weight);
-        let mut buf = TextBuffer::new(&mut text_engine.font_system, metrics);
-        if let Some(mw) = max_width {
-            buf.set_wrap(Wrap::WordOrGlyph);
-            buf.set_size(Some((mw * s).max(20.0)), None);
-        }
-        buf.set_text(text, &attrs, Shaping::Advanced, None);
-        buf.shape_until_scroll(&mut text_engine.font_system, false);
+        let width = max_width.map(|mw| (mw * s).max(20.0));
+        let buf = text_engine.layout(text, phys_size, phys_line_h, weight, width);
 
         let origin_x = (x * s).round();
         let origin_y = (y * s).round();
         let col_f32 = color.to_f32();
         let mut max_w_phys = 0.0_f32;
 
-        for (line_idx, run) in buf.layout_runs().enumerate() {
-            if line_idx >= max_lines {
-                break;
-            }
+        for run in buf.layout_runs().skip(first_line).take(max_lines) {
             max_w_phys = max_w_phys.max(run.line_w);
             for glyph in run.glyphs.iter() {
-                let physical = glyph.physical((origin_x, origin_y + run.line_y), 1.0);
+                let line_y = run.line_y - first_line as f32 * phys_line_h;
+                let physical = glyph.physical((origin_x, origin_y + line_y), 1.0);
                 if let Some(cached) = text_engine.get_or_cache_glyph(physical.cache_key) {
                     let gx = physical.x as f32 + cached.left;
                     let gy = physical.y as f32 - cached.top;
@@ -597,14 +895,8 @@ impl DrawList {
     ) -> f32 {
         let s = self.scale;
         let phys_size = size * s;
-        let metrics = Metrics::new(phys_size, phys_size * 1.25);
-        let attrs = TextEngine::ui_attrs(text_engine.ui_family, weight);
-        let mut buf = TextBuffer::new(&mut text_engine.font_system, metrics);
         let max_inner_w = (rect.w - 14.0).max(20.0) * s;
-        buf.set_wrap(Wrap::WordOrGlyph);
-        buf.set_size(Some(max_inner_w), None);
-        buf.set_text(text, &attrs, Shaping::Advanced, None);
-        buf.shape_until_scroll(&mut text_engine.font_system, false);
+        let buf = text_engine.layout(text, phys_size, phys_size * 1.25, weight, Some(max_inner_w));
 
         let col_f32 = color.to_f32();
         let Some(run) = buf.layout_runs().next() else {
@@ -646,15 +938,8 @@ impl DrawList {
     ) -> f32 {
         let s = self.scale;
         let phys_size = size * s;
-        let metrics = Metrics::new(phys_size, phys_size * 1.25);
-        let attrs = TextEngine::ui_attrs(text_engine.ui_family, weight);
-        let mut buf = TextBuffer::new(&mut text_engine.font_system, metrics);
-        if let Some(mw) = max_width {
-            buf.set_wrap(Wrap::WordOrGlyph);
-            buf.set_size(Some((mw * s).max(20.0)), None);
-        }
-        buf.set_text(text, &attrs, Shaping::Advanced, None);
-        buf.shape_until_scroll(&mut text_engine.font_system, false);
+        let width = max_width.map(|mw| (mw * s).max(20.0));
+        let buf = text_engine.layout(text, phys_size, phys_size * 1.25, weight, width);
 
         let col_f32 = color.to_f32();
         let Some(run) = buf.layout_runs().next() else {
@@ -961,7 +1246,7 @@ impl GpuContext {
             mapped_at_creation: false,
         });
 
-        Ok(GpuWindowRenderer {
+        let renderer = GpuWindowRenderer {
             surface,
             config,
             uniform_buffer,
@@ -969,18 +1254,30 @@ impl GpuContext {
             instance_capacity,
             atlas_texture,
             bind_group,
-        })
+        };
+        renderer.write_screen_size(&self.queue);
+        Ok(renderer)
     }
 }
 
 impl GpuWindowRenderer {
     pub fn resize(&mut self, ctx: &GpuContext, width: u32, height: u32) {
-        if width == 0 || height == 0 {
+        if width == 0 || height == 0 || (width == self.config.width && height == self.config.height)
+        {
             return;
         }
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&ctx.device, &self.config);
+        self.write_screen_size(&ctx.queue);
+    }
+
+    fn write_screen_size(&self, queue: &wgpu::Queue) {
+        let uniforms = Uniforms {
+            screen_size: [self.config.width as f32, self.config.height as f32],
+            _pad: [0.0; 2],
+        };
+        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
 
     pub fn render(
@@ -1015,13 +1312,6 @@ impl GpuWindowRenderer {
                 },
             );
         }
-
-        let uniforms = Uniforms {
-            screen_size: [self.config.width as f32, self.config.height as f32],
-            _pad: [0.0; 2],
-        };
-        ctx.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
 
         if draw_list.instances.len() > self.instance_capacity {
             self.instance_capacity = draw_list.instances.len().next_power_of_two();
@@ -1090,8 +1380,24 @@ impl GpuWindowRenderer {
             rpass.set_pipeline(&ctx.pipeline);
             rpass.set_bind_group(0, &self.bind_group, &[]);
             rpass.set_vertex_buffer(0, self.instance_buffer.slice(..));
-            if !draw_list.instances.is_empty() {
-                rpass.draw(0..6, 0..draw_list.instances.len() as u32);
+            let count = draw_list.instances.len() as u32;
+            if let Some((start, end, rect)) = draw_list.clipped_instances {
+                let scale = draw_list.scale;
+                let width = self.config.width;
+                let height = self.config.height;
+                let left = ((rect.x * scale).ceil() as u32).min(width);
+                let top = ((rect.y * scale).ceil() as u32).min(height);
+                let right = (((rect.x + rect.w) * scale).floor() as u32).min(width);
+                let bottom = (((rect.y + rect.h) * scale).floor() as u32).min(height);
+                rpass.draw(0..6, 0..start);
+                if right > left && bottom > top {
+                    rpass.set_scissor_rect(left, top, right - left, bottom - top);
+                    rpass.draw(0..6, start..end);
+                    rpass.set_scissor_rect(0, 0, width, height);
+                }
+                rpass.draw(0..6, end..count);
+            } else if count > 0 {
+                rpass.draw(0..6, 0..count);
             }
         }
 
@@ -1104,6 +1410,42 @@ impl GpuWindowRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_layouts_are_reused_by_metrics_without_retaining_drafts() {
+        let mut text = TextEngine::new();
+        let layout = text.layout(
+            "Browse models",
+            13.0,
+            16.25,
+            FontWeight::Regular,
+            Some(120.0),
+        );
+        let same = text.layout(
+            "Browse models",
+            13.0,
+            16.25,
+            FontWeight::Regular,
+            Some(120.0),
+        );
+        let narrower = text.layout(
+            "Browse models",
+            13.0,
+            16.25,
+            FontWeight::Regular,
+            Some(40.0),
+        );
+        assert!(Rc::ptr_eq(&layout, &same));
+        assert!(!Rc::ptr_eq(&layout, &narrower));
+        assert_eq!(text.layout_order.len(), 2);
+
+        text.with_uncached_layouts(|text| {
+            text.measure("Uncached draft", 13.0, FontWeight::Regular);
+        });
+        assert_eq!(text.layout_order.len(), 2);
+        text.clear_layouts();
+        assert!(text.layouts.is_empty());
+    }
 
     #[test]
     fn proportional_ui_font_is_not_monospace() {
@@ -1120,4 +1462,33 @@ mod tests {
             te.ui_family
         );
     }
+}
+#[test]
+fn animated_svg_moves_the_download_arrow_independently_of_the_tray() {
+    let mut text = TextEngine::new();
+    let mut draw = DrawList::new(1.0);
+    let bounds = Rect::new(10.0, 10.0, 16.0, 16.0);
+    draw.draw_animated_icon(
+        &mut text,
+        IconId::Download,
+        bounds,
+        16.0,
+        Rgba::rgb(255, 255, 255),
+        130.0,
+    );
+    assert_eq!(draw.instances.len(), 2);
+    assert_eq!(draw.instances[0].pos, [10.0, 10.0]);
+    assert_eq!(draw.instances[1].pos, [10.0, 11.5]);
+
+    draw.clear(1.0);
+    draw.draw_animated_icon(
+        &mut text,
+        IconId::Download,
+        bounds,
+        16.0,
+        Rgba::rgb(255, 255, 255),
+        f32::INFINITY,
+    );
+    assert_eq!(draw.instances.len(), 1);
+    assert_eq!(draw.instances[0].pos, [10.0, 10.0]);
 }

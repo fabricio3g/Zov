@@ -3,7 +3,7 @@ name = "enio"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Enio — Native GPU-accelerated desktop dictation and speech-to-text app"
+description = "Zov — Native GPU-accelerated desktop dictation and speech-to-text app"
 
 [profile.dev]
 debug = "line-tables-only"

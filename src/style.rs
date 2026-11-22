@@ -35,6 +35,15 @@ pub fn toggle_theme() -> Theme {
     next
 }
 
+pub fn window_border_color(focused: bool) -> Rgba {
+    match (current_theme(), focused) {
+        (Theme::Dark, true) => Rgba::rgb(77, 77, 77),
+        (Theme::Dark, false) => Rgba::rgb(55, 55, 55),
+        (Theme::Light, true) => Rgba::rgb(142, 142, 142),
+        (Theme::Light, false) => Rgba::rgb(186, 186, 186),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rgba(pub [u8; 4]);
 
@@ -88,6 +97,8 @@ pub struct Palette {
     pub segment_active: Rgba,
     pub seam: Rgba,
     pub ring: Rgba,
+    pub popover_border: Rgba,
+    pub popover_shadow: Rgba,
     pub ring_focus: Rgba,
     pub backdrop: Rgba,
     pub fg: Rgba,
@@ -118,6 +129,8 @@ pub fn palette() -> Palette {
             segment_active: Rgba::rgba(255, 255, 255, 34), // rgba(255,255,255,0.14) (--segment-active-bg)
             seam: Rgba::rgba(255, 255, 255, 20),     // #ffffff14 (--border)
             ring: Rgba::rgba(255, 255, 255, 26),     // rgba(255,255,255,0.10) (--composer-ring)
+            popover_border: Rgba::rgba(255, 255, 255, 33),
+            popover_shadow: Rgba::rgba(0, 0, 0, 125),
             ring_focus: Rgba::rgba(255, 255, 255, 62), // rgba(255,255,255,0.24) (--composer-ring-focus)
             backdrop: Rgba::rgba(0, 0, 0, 154),      // rgba(0,0,0,0.6) (--overlay)
             fg: Rgba::rgb(250, 250, 250),            // #fafafa (--foreground)
@@ -145,6 +158,8 @@ pub fn palette() -> Palette {
             segment_active: Rgba::rgb(255, 255, 255), // #ffffff (--segment-active-bg)
             seam: Rgba::rgba(0, 0, 0, 20),           // rgba(0,0,0,0.08) (--border)
             ring: Rgba::rgba(0, 0, 0, 24),           // rgba(0,0,0,0.09) (--composer-ring)
+            popover_border: Rgba::rgba(0, 0, 0, 28),
+            popover_shadow: Rgba::rgba(21, 24, 29, 49),
             ring_focus: Rgba::rgba(0, 0, 0, 68),     // rgba(0,0,0,0.26) (--composer-ring-focus)
             backdrop: Rgba::rgba(0, 0, 0, 90),       // rgba(0,0,0,0.35) (--overlay)
             fg: Rgba::rgb(0, 0, 0),                  // #000000 (--foreground)

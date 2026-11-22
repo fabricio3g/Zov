@@ -7,11 +7,11 @@
 //! - Borderless always-on-top Floating Speech Overlay Pill for system-wide `Ctrl+Shift+Space` dictation.
 
 use crate::catalog::{
-    all_stt_choices, find_commercial_provider, LocalEngineKind, UnifiedSttChoice,
-    LOCAL_WHISPER_CATALOG,
+    all_stt_choices, find_commercial_provider, find_local_whisper_spec, LocalEngineKind,
+    UnifiedSttChoice, LOCAL_WHISPER_CATALOG,
 };
-use crate::config::{AppPaths, DictateConfig, HistoryEntry, HotkeyMode};
-use crate::engine::{check_local_whisper_model, installed_local_models, is_local_engine_ready};
+use crate::config::{DeliveryMode, DictateConfig, HistoryEntry, HotkeyMode, LANGUAGES};
+use crate::engine::{DownloadProgress, InstallStatus, InstallTarget, LocalInventory};
 use crate::gpu_ui::{DrawList, FontWeight, IconId, Rect, TextEngine};
 use crate::style::{current_theme, palette, Palette, Rgba, Theme};
 use crate::vad::HISTORY_BARS;
@@ -51,8 +51,68 @@ pub enum DictationPhase {
     Idle,
     Recording,
     Transcribing,
-    Installing { label: String, progress: u8 },
+    SetupRequired,
     Error(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DownloadState {
+    Running(InstallStatus),
+    Paused,
+    Failed(String),
+    Completed,
+    Canceled,
+}
+
+pub struct DownloadJob {
+    pub target: InstallTarget,
+    pub state: DownloadState,
+    pub progress: Option<DownloadProgress>,
+    pub stopping: bool,
+}
+
+impl DownloadJob {
+    pub fn is_running(&self) -> bool {
+        matches!(self.state, DownloadState::Running(_)) && !self.stopping
+    }
+
+    pub fn name(&self) -> &str {
+        self.target.name()
+    }
+
+    pub fn label(&self) -> &str {
+        if self.stopping {
+            return "Stopping…";
+        }
+        match &self.state {
+            DownloadState::Running(stage) => stage.label(),
+            DownloadState::Paused => "Paused",
+            DownloadState::Failed(_) => "Download failed",
+            DownloadState::Completed => "Installed",
+            DownloadState::Canceled => "Canceled",
+        }
+    }
+
+    pub fn can_pause(&self) -> bool {
+        !self.stopping
+            && matches!(
+                self.state,
+                DownloadState::Running(InstallStatus::DownloadingModel(_))
+            )
+    }
+
+    pub fn can_cancel(&self) -> bool {
+        !self.stopping
+            && matches!(
+                self.state,
+                DownloadState::Running(
+                    InstallStatus::Checking
+                        | InstallStatus::DownloadingEngine(_)
+                        | InstallStatus::DownloadingModel(_)
+                ) | DownloadState::Paused
+                    | DownloadState::Failed(_)
+            )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,6 +125,7 @@ pub enum ProviderField {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Modal {
     None,
+    Downloads,
     ProviderConfig {
         provider_id: String,
         provider_name: String,
@@ -74,16 +135,17 @@ pub enum Modal {
         api_key: String,
         active_field: ProviderField,
         reveal_key: bool,
+        select_model: Option<String>,
     },
-    ConfirmDownload {
-        model_id: String,
-        label: String,
-        size_mb: u32,
-        engine_name: String,
-    },
+    ConfirmDownload(InstallTarget),
     ConfirmDeleteClip {
-        index: usize,
+        id: String,
         preview: String,
+    },
+    Transcript {
+        id: String,
+        scroll: usize,
+        copied: bool,
     },
 }
 
@@ -91,6 +153,15 @@ pub enum Modal {
 pub enum ScrollList {
     Models,
     History,
+    Transcript,
+    Settings,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComposerMenu {
+    Models,
+    Language,
+    Delivery,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,20 +172,29 @@ pub enum HitTarget {
     CloseWindow,
     SwitchView(AppView),
     ToggleRecord,
-    ToggleModelDropdown,
-    CloseModelDropdown,
+    CancelRecording,
+    ToggleComposerMenu(ComposerMenu),
+    CloseComposerMenu,
     SelectDropdownLocal(String),
     SelectDropdownCloud {
         backend: String,
         model_id: String,
     },
-    InstallLocalEngine,
+    DownloadLocalModel(String),
+    InstallEngine(LocalEngineKind),
+    OpenEngineSettings,
+    ToggleDownloads,
+    PauseDownload,
+    ResumeDownload,
+    CancelDownload,
     CycleLanguage,
+    SetLanguage(&'static str),
     CycleHotkeyMode,
     CycleMicrophone,
     RefreshMicrophones,
     ToggleVad,
     CycleDelivery,
+    SetDelivery(DeliveryMode),
     ToggleTheme,
     OpenProviderConfig(String),
     FocusProviderField(ProviderField),
@@ -124,10 +204,9 @@ pub enum HitTarget {
     SetModelTab(ModelFilterTab),
     PickModel(usize),
     ActivateLocalModel(String),
-    SelectHistory(usize),
-    CopyHistory(usize),
-    TypeHistory(usize),
-    RequestDeleteHistory(usize),
+    OpenHistory(String),
+    CopyHistory(String),
+    RequestDeleteHistory(String),
     Scrollbar {
         list: ScrollList,
         track_y: i32,
@@ -136,8 +215,9 @@ pub enum HitTarget {
         visible: usize,
     },
     SaveProviderConfig,
-    ConfirmDownloadModel,
+    ConfirmInstall,
     ConfirmDeleteClip,
+    KeepModalOpen,
     CloseModal,
 }
 
@@ -152,7 +232,8 @@ impl HitTarget {
             Self::DragWindow
                 | Self::FocusModelSearch
                 | Self::FocusProviderField(_)
-                | Self::CloseModelDropdown
+                | Self::KeepModalOpen
+                | Self::CloseComposerMenu
         )
     }
 }
@@ -166,21 +247,30 @@ pub struct HitZone {
 pub struct UiSnapshot<'a> {
     pub width: f32,
     pub height: f32,
+    pub window_border: Option<Rgba>,
     pub view: AppView,
     pub model_tab: ModelFilterTab,
     pub model_filter: &'a str,
     pub model_search_focused: bool,
-    pub model_dropdown_open: bool,
+    pub composer_menu: Option<ComposerMenu>,
     pub caret_visible: bool,
     pub model_selected: usize,
     pub model_scroll: usize,
+    pub settings_scroll: usize,
     pub config: &'a DictateConfig,
-    pub paths: &'a AppPaths,
+    pub inventory: &'a LocalInventory,
+    pub model_choices: &'a [UnifiedSttChoice],
     pub phase: &'a DictationPhase,
+    pub download: Option<&'a DownloadJob>,
+    pub recent_downloads: &'a [InstallTarget],
+    pub download_fraction: Option<f32>,
+    pub page_t: f32,
+    pub popup_t: f32,
+    pub modal_t: f32,
+    pub dictation_t: f32,
     pub elapsed_secs: u64,
     pub history_bars: &'a [f32],
     pub vad_speaking: bool,
-    pub live_preview: &'a str,
     pub history: &'a [HistoryEntry],
     pub selected_history: usize,
     pub history_scroll: usize,
@@ -189,12 +279,35 @@ pub struct UiSnapshot<'a> {
     pub active_mic_name: &'a str,
     pub mouse_pos: (f32, f32),
     pub hover_t: f32,
+    pub leaving_hover: Option<(&'a HitTarget, f32)>,
+    pub icon_hover_ms: f32,
+    pub spinner_angle: f32,
     pub pressed_target: Option<&'a HitTarget>,
     pub dragging_scrollbar: Option<ScrollList>,
 }
 
+impl UiSnapshot<'_> {
+    fn hover_level(&self, target: &HitTarget, hovered: bool) -> f32 {
+        if hovered {
+            self.hover_t
+        } else {
+            self.leaving_hover
+                .filter(|(old, _)| *old == target)
+                .map_or(0.0, |(_, amount)| amount)
+        }
+    }
+
+    fn icon_time(&self, hovered: bool) -> f32 {
+        if hovered {
+            self.icon_hover_ms
+        } else {
+            f32::INFINITY
+        }
+    }
+}
+
 pub fn filtered_stt_choices(
-    paths: &AppPaths,
+    inventory: &LocalInventory,
     config: &DictateConfig,
     tab: ModelFilterTab,
     filter: &str,
@@ -206,7 +319,7 @@ pub fn filtered_stt_choices(
             let tab_ok = match tab {
                 ModelFilterTab::Installed => {
                     if c.is_local {
-                        check_local_whisper_model(paths, &c.model_id).is_some()
+                        inventory.contains(&c.model_id)
                     } else {
                         config.has_api_key(&c.backend)
                     }
@@ -262,7 +375,7 @@ pub fn filtered_stt_choices(
         } else {
             config.backend == c.backend && config.commercial_model == c.model_id
         };
-        let is_installed = c.is_local && check_local_whisper_model(paths, &c.model_id).is_some();
+        let is_installed = c.is_local && inventory.contains(&c.model_id);
         if is_active {
             0
         } else if is_installed {
@@ -318,7 +431,9 @@ fn draw_scrollbar(
 
     let max_scroll = total.saturating_sub(visible).max(1);
     let ratio = scroll.min(max_scroll) as f32 / max_scroll as f32;
-    let thumb_h = (track_h * (visible as f32 / total as f32)).clamp(28.0, track_h);
+    let thumb_h = (track_h * (visible as f32 / total as f32))
+        .max(28.0)
+        .min(track_h);
     let thumb_y = track_y + (track_h - thumb_h) * ratio;
     let thumb_col = if is_dragging {
         pal.accent
@@ -354,6 +469,7 @@ fn draw_chip(
     x: f32,
     y: f32,
     height: f32,
+    max_width: f32,
     label: &str,
     active: bool,
     target: HitTarget,
@@ -367,7 +483,7 @@ fn draw_chip(
         FontWeight::Semibold
     };
     let text_w = te.measure(label, 12.5, weight);
-    let w = (text_w + 24.0).max(52.0);
+    let w = (text_w + 18.0).clamp(44.0, max_width);
     let is_pressed = pressed.is_some_and(|p| p == &target);
     let dy = if is_pressed { 1.0 } else { 0.0 };
     let rect = Rect::new(x, y + dy, w, height);
@@ -393,20 +509,7 @@ fn draw_chip(
     let fg = base_fg.lerp(hover_fg, ht);
 
     if fill.0[3] > 0 {
-        let ring = if active {
-            pal.ring
-        } else if hovered {
-            pal.seam.with_alpha((f32::from(pal.seam.0[3]) * ht) as u8)
-        } else {
-            Rgba::transparent()
-        };
-        dl.fill_rect_bordered(
-            rect,
-            8.0,
-            fill,
-            if active || hovered { 1.0 } else { 0.0 },
-            ring,
-        );
+        dl.fill_rect(rect, 6.0, fill);
     }
     dl.draw_text_centered(te, rect, 12.5, fg, weight, label);
     hits.push(HitZone {
@@ -470,46 +573,81 @@ fn draw_modal_button(
     hover_t: f32,
     pressed: Option<&HitTarget>,
 ) -> f32 {
+    draw_labeled_button(
+        dl, te, hits, pal, x, y, height, label, tone, target, mouse, hover_t, pressed, None,
+    )
+}
+
+const BUTTON_ICON_SPAN: f32 = 21.0;
+
+#[allow(clippy::too_many_arguments)]
+fn draw_labeled_button(
+    dl: &mut DrawList,
+    te: &mut TextEngine,
+    hits: &mut Vec<HitZone>,
+    pal: &Palette,
+    x: f32,
+    y: f32,
+    height: f32,
+    label: &str,
+    tone: ModalBtnTone,
+    target: HitTarget,
+    mouse: (f32, f32),
+    hover_t: f32,
+    pressed: Option<&HitTarget>,
+    icon: Option<(IconId, f32)>,
+) -> f32 {
     let weight = match tone {
         ModalBtnTone::Secondary => FontWeight::Semibold,
         ModalBtnTone::Primary | ModalBtnTone::Danger => FontWeight::Bold,
     };
     let text_w = te.measure(label, 12.5, weight);
-    let w = (text_w + 28.0).max(84.0);
+    let icon_span = if icon.is_some() { BUTTON_ICON_SPAN } else { 0.0 };
+    let w = (text_w + 28.0 + icon_span).max(84.0);
     let is_pressed = pressed.is_some_and(|p| p == &target);
     let dy = if is_pressed { 1.0 } else { 0.0 };
     let rect = Rect::new(x, y + dy, w, height);
     let hovered = rect.contains(mouse.0, mouse.1);
     let ht = if hovered { hover_t } else { 0.0 };
 
-    let (base_fill, hover_fill, base_fg, hover_fg, border) = match tone {
+    let (base_fill, hover_fill, base_fg, hover_fg) = match tone {
         // High-contrast monochrome primary CTA (solid white + black text in dark, black + white in light)
         ModalBtnTone::Primary => (
             pal.primary,
             pal.primary_hover,
             pal.primary_fg,
             pal.primary_fg,
-            pal.primary,
         ),
         ModalBtnTone::Danger => (
             pal.error.with_alpha(34),
             pal.error,
             pal.error,
             Rgba::rgb(26, 26, 26),
-            pal.error.with_alpha(90),
         ),
         ModalBtnTone::Secondary => (
-            pal.bg_element,
+            pal.bg_hover.with_alpha(0),
             if is_pressed { pal.bg_active } else { pal.bg_hover },
             pal.fg_muted,
             pal.fg,
-            pal.ring,
         ),
     };
     let fill = base_fill.lerp(hover_fill, ht);
     let fg = base_fg.lerp(hover_fg, ht);
-    dl.fill_rect_bordered(rect, 6.0, fill, 1.0, border);
-    dl.draw_text_centered(te, rect, 12.5, fg, weight, label);
+    if fill.0[3] > 0 {
+        dl.fill_rect(rect, 6.0, fill);
+    }
+    if let Some((icon, elapsed)) = icon {
+        let left = rect.x + (rect.w - text_w - icon_span) * 0.5;
+        dl.draw_animated_icon(
+            te, icon, Rect::new(left, rect.y, 15.0, rect.h), 15.0, fg,
+            if hovered { elapsed } else { f32::INFINITY },
+        );
+        dl.draw_text_vcentered(
+            te, left + icon_span, rect.y + rect.h * 0.5, 12.5, fg, weight, None, label,
+        );
+    } else {
+        dl.draw_text_centered(te, rect, 12.5, fg, weight, label);
+    }
     hits.push(HitZone {
         rect: Rect::new(x, y, w, height),
         target,
@@ -522,6 +660,409 @@ enum ModalBtnTone {
     Primary,
     Danger,
     Secondary,
+}
+
+fn downloads_button_rect(width: f32) -> Rect {
+    Rect::new(width - 199.0, 4.0, 30.0, 30.0)
+}
+
+fn draw_floating_surface(dl: &mut DrawList, pal: &Palette, rect: Rect, radius: f32) {
+    dl.drop_shadow(rect, radius, 9.0, 5.0, pal.popover_shadow);
+    dl.fill_rect_bordered(rect, radius, pal.bg_popover, 1.0, pal.popover_border);
+}
+
+fn draw_download_bar(dl: &mut DrawList, pal: &Palette, track: Rect, fraction: Option<f32>) {
+    if let Some(fraction) = fraction {
+        dl.fill_rect(track, track.h * 0.5, pal.bg_active);
+        if fraction > 0.0 {
+            let fill = Rect::new(track.x, track.y, track.w * fraction, track.h);
+            dl.fill_rect(fill, track.h * 0.5, pal.fg_muted);
+        }
+    }
+}
+
+fn draw_recording_waveform(dl: &mut DrawList, pal: &Palette, rect: Rect, history_bars: &[f32]) {
+    if rect.w < 24.0 || history_bars.is_empty() {
+        return;
+    }
+    let num_bars = HISTORY_BARS.min((rect.w / 6.0).floor() as usize).max(12);
+    let step = rect.w / num_bars as f32;
+    let bar_w = (step * 0.48).clamp(2.0, 3.5);
+    let cy = rect.y + rect.h * 0.5;
+    let max_h = (rect.h - 8.0).max(8.0);
+    let slice_start = history_bars.len().saturating_sub(num_bars);
+    for (i, &val) in history_bars[slice_start..].iter().enumerate() {
+        let v = val.clamp(0.0, 1.0);
+        let bh = (3.5 + v * (max_h - 3.5)).min(max_h);
+        let bx = rect.x + i as f32 * step;
+        let col = pal
+            .accent_soft
+            .lerp(pal.accent, (0.25 + v * 1.15).clamp(0.0, 1.0));
+        dl.fill_rect(Rect::new(bx, cy - bh * 0.5, bar_w, bh), bar_w * 0.5, col);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_download_status(
+    dl: &mut DrawList,
+    te: &mut TextEngine,
+    hits: &mut Vec<HitZone>,
+    tooltip: &mut Option<(Rect, &'static str)>,
+    pal: &Palette,
+    snap: &UiSnapshot<'_>,
+    rect: Rect,
+    job: &DownloadJob,
+) {
+    let pause =
+        job.can_pause()
+            .then_some((IconId::Pause, HitTarget::PauseDownload, "Pause download"));
+    let resume = match job.state {
+        DownloadState::Paused => Some((IconId::Play, HitTarget::ResumeDownload, "Resume download")),
+        DownloadState::Failed(_) => {
+            Some((IconId::Refresh, HitTarget::ResumeDownload, "Retry download"))
+        }
+        _ => None,
+    };
+    let cancel =
+        job.can_cancel()
+            .then_some((IconId::Close, HitTarget::CancelDownload, "Cancel download"));
+    let mut right = rect.x + rect.w;
+    for (icon, target, tip) in [cancel, pause.or(resume)].into_iter().flatten() {
+        right -= 29.0;
+        let button = Rect::new(right, rect.y, 26.0, 26.0);
+        let hovered = button.contains(snap.mouse_pos.0, snap.mouse_pos.1);
+        if hovered {
+            dl.fill_rect(
+                button,
+                5.0,
+                pal.bg_hover.with_alpha((255.0 * snap.hover_t) as u8),
+            );
+            *tooltip = Some((button, tip));
+        }
+        dl.draw_animated_icon(
+            te,
+            icon,
+            button,
+            13.0,
+            if hovered { pal.fg } else { pal.fg_muted },
+            snap.icon_time(hovered),
+        );
+        hits.push(HitZone {
+            rect: button,
+            target,
+        });
+    }
+
+    let failed = matches!(job.state, DownloadState::Failed(_));
+    dl.draw_text_vcentered(
+        te,
+        rect.x,
+        rect.y + 12.0,
+        12.0,
+        if failed { pal.error } else { pal.fg },
+        FontWeight::Semibold,
+        Some(right - rect.x - 4.0),
+        job.label(),
+    );
+
+    let transfer = match &job.state {
+        DownloadState::Running(status) => {
+            status.transfer().map(|progress| progress.transfer_label())
+        }
+        DownloadState::Paused => job.progress.map(|progress| progress.label()),
+        _ => None,
+    };
+    if let Some(transfer) = transfer {
+        dl.draw_text_vcentered(
+            te,
+            rect.x,
+            rect.y + 30.0,
+            11.0,
+            pal.fg_muted,
+            FontWeight::Regular,
+            Some(rect.w),
+            &transfer,
+        );
+        draw_download_bar(
+            dl,
+            pal,
+            Rect::new(rect.x, rect.y + 40.0, rect.w, 3.0),
+            snap.download_fraction,
+        );
+    } else if let DownloadState::Failed(message) = &job.state {
+        dl.draw_text(
+            te,
+            rect.x,
+            rect.y + 24.0,
+            11.5,
+            pal.fg_muted,
+            FontWeight::Regular,
+            Some(rect.w),
+            if rect.h > 50.0 { 2 } else { 1 },
+            message,
+        );
+    }
+}
+
+fn render_downloads_popover(
+    dl: &mut DrawList,
+    te: &mut TextEngine,
+    hits: &mut Vec<HitZone>,
+    pal: &Palette,
+    snap: &UiSnapshot<'_>,
+) {
+    let controls: Vec<_> = hits
+        .iter()
+        .filter(|zone| {
+            matches!(
+                zone.target,
+                HitTarget::ToggleDownloads
+                    | HitTarget::MinimizeWindow
+                    | HitTarget::MaximizeWindow
+                    | HitTarget::CloseWindow
+                    | HitTarget::ToggleTheme
+            )
+        })
+        .take(5)
+        .cloned()
+        .collect();
+    hits.clear();
+    hits.push(HitZone {
+        rect: Rect::new(0.0, 0.0, snap.width, snap.height),
+        target: HitTarget::CloseModal,
+    });
+    hits.extend(controls);
+
+    let earlier: Vec<_> = snap
+        .recent_downloads
+        .iter()
+        .filter(|target| snap.download.is_none_or(|job| &job.target != *target))
+        .collect();
+    let w = 368.0;
+    let earlier_height = if earlier.is_empty() {
+        0.0
+    } else {
+        28.0 + 26.0 * earlier.len() as f32
+    };
+    let h = if snap.download.is_some() { 126.0 } else { 81.0 } + earlier_height;
+    let button = downloads_button_rect(snap.width);
+    let panel = Rect::new(button.x + button.w - w, button.y + button.h + 5.0, w, h);
+    draw_floating_surface(dl, pal, panel, 10.0);
+    hits.push(HitZone {
+        rect: panel,
+        target: HitTarget::KeepModalOpen,
+    });
+    let x = panel.x + 16.0;
+    dl.draw_text_vcentered(
+        te,
+        x,
+        panel.y + 20.0,
+        14.0,
+        pal.fg,
+        FontWeight::Semibold,
+        None,
+        "Downloads",
+    );
+
+    let browse = Rect::new(panel.x + w - 114.0, panel.y + 8.0, 102.0, 25.0);
+    let browse_hover = browse.contains(snap.mouse_pos.0, snap.mouse_pos.1);
+    dl.draw_text_centered(
+        te,
+        browse,
+        11.5,
+        if browse_hover { pal.fg } else { pal.fg_muted },
+        FontWeight::Semibold,
+        "Browse models",
+    );
+    hits.push(HitZone {
+        rect: browse,
+        target: HitTarget::SwitchView(AppView::Models),
+    });
+
+    let mut tooltip = None;
+    if let Some(job) = snap.download {
+        draw_centered_icon(
+            dl,
+            te,
+            if matches!(job.target, InstallTarget::Engine(_)) {
+                IconId::Cpu
+            } else {
+                IconId::Mic
+            },
+            Rect::new(x, panel.y + 43.0, 19.0, 18.0),
+            13.0,
+            pal.fg_muted,
+        );
+        dl.draw_text_vcentered(
+            te,
+            x + 25.0,
+            panel.y + 52.0,
+            13.0,
+            pal.fg,
+            FontWeight::Semibold,
+            Some(w - 58.0),
+            job.name(),
+        );
+        draw_download_status(
+            dl,
+            te,
+            hits,
+            &mut tooltip,
+            pal,
+            snap,
+            Rect::new(x, panel.y + 64.0, w - 32.0, 54.0),
+            job,
+        );
+    } else {
+        dl.draw_text_vcentered(
+            te,
+            x,
+            panel.y + 56.0,
+            12.5,
+            pal.fg_muted,
+            FontWeight::Regular,
+            None,
+            "No downloads yet.",
+        );
+    }
+    if !earlier.is_empty() {
+        let y = panel.y + panel.h - earlier_height;
+        dl.fill_rect(Rect::new(x, y, w - 32.0, 1.0), 0.0, pal.seam);
+        dl.draw_text_vcentered(
+            te,
+            x,
+            y + 15.0,
+            11.0,
+            pal.fg_muted,
+            FontWeight::Semibold,
+            None,
+            "Earlier",
+        );
+        for (i, target) in earlier.iter().enumerate() {
+            let cy = y + 36.0 + i as f32 * 26.0;
+            draw_centered_icon(
+                dl,
+                te,
+                IconId::Check,
+                Rect::new(x, cy - 8.0, 16.0, 16.0),
+                13.0,
+                pal.fg_muted,
+            );
+            dl.draw_text_vcentered(
+                te,
+                x + 24.0,
+                cy,
+                12.0,
+                pal.fg_prose,
+                FontWeight::Regular,
+                Some(w - 60.0),
+                target.name(),
+            );
+        }
+    }
+    if let Some((anchor, label)) = tooltip {
+        draw_tooltip(dl, te, pal, snap.width, snap.height, anchor, label);
+    }
+}
+
+#[cfg(test)]
+mod download_ui_tests {
+    use super::*;
+
+    #[test]
+    fn download_actions_and_speech_engine_setup_are_reachable() {
+        let config = DictateConfig::default();
+        let inventory = LocalInventory::default();
+        let job = DownloadJob {
+            target: InstallTarget::Model("small_q5".into()),
+            state: DownloadState::Paused,
+            progress: None,
+            stopping: false,
+        };
+        let snap = UiSnapshot {
+            width: 720.0,
+            height: 460.0,
+            window_border: Some(Rgba::rgb(77, 77, 77)),
+            view: AppView::Models,
+            model_tab: ModelFilterTab::All,
+            model_filter: "",
+            model_search_focused: false,
+            composer_menu: None,
+            caret_visible: false,
+            model_selected: 0,
+            model_scroll: 0,
+            settings_scroll: 0,
+            config: &config,
+            inventory: &inventory,
+            model_choices: &[],
+            phase: &DictationPhase::Idle,
+            download: Some(&job),
+            recent_downloads: &[],
+            download_fraction: None,
+            page_t: 1.0,
+            popup_t: 1.0,
+            modal_t: 0.4,
+            dictation_t: 1.0,
+            elapsed_secs: 0,
+            history_bars: &[],
+            vad_speaking: false,
+            history: &[],
+            selected_history: 0,
+            history_scroll: 0,
+            status_toast: None,
+            modal: &Modal::Downloads,
+            active_mic_name: "System default",
+            mouse_pos: (-1.0, -1.0),
+            hover_t: 1.0,
+            leaving_hover: None,
+            icon_hover_ms: f32::INFINITY,
+            spinner_angle: 0.0,
+            pressed_target: None,
+            dragging_scrollbar: None,
+        };
+        let mut draw = DrawList::new(1.0);
+        let mut text = TextEngine::new();
+        let hits = render_main_window(&mut draw, &mut text, &snap);
+        for target in [
+            HitTarget::ToggleDownloads,
+            HitTarget::CloseWindow,
+            HitTarget::ResumeDownload,
+            HitTarget::CancelDownload,
+        ] {
+            let zone = hits.iter().find(|zone| zone.target == target).unwrap();
+            let x = zone.rect.x + zone.rect.w * 0.5;
+            let y = zone.rect.y + zone.rect.h * 0.5;
+            assert_eq!(hit_test(&hits, x, y), Some(target));
+        }
+        assert_eq!(hit_test(&hits, 50.0, 200.0), Some(HitTarget::CloseModal));
+        assert!(draw.instances.iter().any(|shape| shape.params[2] == 2.0));
+
+        draw.clear(1.0);
+        let settings = UiSnapshot {
+            view: AppView::Settings,
+            modal: &Modal::None,
+            download: None,
+            ..snap
+        };
+        let hits = render_main_window(&mut draw, &mut text, &settings);
+        for engine in [LocalEngineKind::WhisperCpp, LocalEngineKind::AudioCpp] {
+            assert!(hits
+                .iter()
+                .any(|zone| zone.target == HitTarget::InstallEngine(engine)));
+        }
+
+        draw.clear(2.0);
+        let confirmation = Modal::ConfirmDownload(InstallTarget::Engine(LocalEngineKind::AudioCpp));
+        let confirming = UiSnapshot {
+            modal: &confirmation,
+            ..settings
+        };
+        let hits = render_main_window(&mut draw, &mut text, &confirming);
+        assert!(hits
+            .iter()
+            .any(|zone| zone.target == HitTarget::ConfirmInstall));
+        assert_eq!(draw.instances.last().unwrap().params[1], 1.0);
+    }
 }
 
 pub fn render_main_window(
@@ -537,19 +1078,59 @@ pub fn render_main_window(
     let sidebar_w = 224.0_f32.min(w * 0.30);
     let titlebar_h = 38.0;
 
-    // ── 1. Layered Surfaces: Sidebar + Main Canvas + Top Chrome Hairline ────
+    // Sidebar and canvas share the window chrome.
     dl.fill_rect(Rect::new(0.0, 0.0, sidebar_w, h), 0.0, pal.bg_sidebar);
-    dl.fill_rect(Rect::new(sidebar_w, 0.0, 1.0, h), 0.0, pal.seam);
-    dl.fill_rect(
-        Rect::new(sidebar_w + 1.0, titlebar_h, w - sidebar_w - 1.0, 1.0),
-        0.0,
-        pal.seam,
-    );
 
     // Draggable custom title bar across the top
     hits.push(HitZone {
-        rect: Rect::new(0.0, 0.0, w - 164.0, titlebar_h),
+        rect: Rect::new(0.0, 0.0, w - 203.0, titlebar_h),
         target: HitTarget::DragWindow,
+    });
+
+    let downloads = downloads_button_rect(w);
+    let hovered = downloads.contains(snap.mouse_pos.0, snap.mouse_pos.1);
+    let download_open = matches!(snap.modal, Modal::Downloads);
+    let tint = pal.fg_dim.lerp(
+        pal.fg,
+        if download_open {
+            1.0
+        } else {
+            snap.hover_level(&HitTarget::ToggleDownloads, hovered)
+        },
+    );
+    if snap.download.is_some_and(DownloadJob::is_running) {
+        dl.draw_rotating_icon(
+            te,
+            IconId::Loader,
+            downloads,
+            15.0,
+            tint,
+            snap.spinner_angle,
+        );
+    } else {
+        dl.draw_animated_icon(
+            te,
+            IconId::Download,
+            downloads,
+            15.0,
+            tint,
+            snap.icon_time(hovered),
+        );
+    }
+    if snap.download.is_some_and(|job| {
+        matches!(
+            job.state,
+            DownloadState::Running(_) | DownloadState::Paused | DownloadState::Failed(_)
+        )
+    }) {
+        dl.fill_circle(downloads.x + 23.0, downloads.y + 7.0, 2.5, pal.fg);
+    }
+    if hovered && !download_open {
+        tooltip = Some((downloads, "Downloads (Ctrl+J)"));
+    }
+    hits.push(HitZone {
+        rect: downloads,
+        target: HitTarget::ToggleDownloads,
     });
 
     // Quick theme toggle icon right next to window controls (matching Agente Code top-right chrome)
@@ -558,7 +1139,6 @@ pub fn render_main_window(
         let trect = Rect::new(w - 162.0, 5.0, 28.0, 28.0);
         let thov = trect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
         if thov {
-            dl.fill_rect(trect, 6.0, pal.bg_hover);
             tooltip = Some((
                 trect,
                 if is_dark {
@@ -568,13 +1148,14 @@ pub fn render_main_window(
                 },
             ));
         }
-        draw_centered_icon(
-            dl,
+        dl.draw_animated_icon(
             te,
             if is_dark { IconId::Sun } else { IconId::Moon },
             trect,
             14.0,
-            if thov { pal.fg } else { pal.fg_dim },
+            pal.fg_dim
+                .lerp(pal.fg, snap.hover_level(&HitTarget::ToggleTheme, thov)),
+            snap.icon_time(thov),
         );
         hits.push(HitZone {
             rect: trect,
@@ -584,54 +1165,45 @@ pub fn render_main_window(
 
     // Window controls (Electron SVG icons: minus, maximize-2, x) on top-right
     let win_btns = [
-        (IconId::Minus, HitTarget::MinimizeWindow, false, "Minimize"),
-        (IconId::Maximize, HitTarget::MaximizeWindow, false, "Maximize / Restore"),
-        (IconId::Close, HitTarget::CloseWindow, true, "Hide to System Tray"),
+        (IconId::Minus, HitTarget::MinimizeWindow, "Minimize"),
+        (
+            IconId::Maximize,
+            HitTarget::MaximizeWindow,
+            "Maximize / Restore",
+        ),
+        (IconId::Close, HitTarget::CloseWindow, "Hide to System Tray"),
     ];
-    for (i, (icon, target, is_close, tip)) in win_btns.into_iter().enumerate() {
+    for (i, (icon, target, tip)) in win_btns.into_iter().enumerate() {
         let bx = w - 126.0 + i as f32 * 42.0;
         let rect = Rect::new(bx, 0.0, 42.0, titlebar_h);
         let hov = rect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
         if hov {
-            dl.fill_rect(
-                rect,
-                0.0,
-                if is_close {
-                    Rgba::rgb(196, 43, 28)
-                } else {
-                    pal.bg_hover
-                },
-            );
             tooltip = Some((rect, tip));
         }
-        draw_centered_icon(
-            dl,
+        dl.draw_animated_icon(
             te,
             icon,
             rect,
             14.0,
-            if hov && is_close {
-                Rgba::rgb(255, 255, 255)
-            } else if hov {
-                pal.fg
-            } else {
-                pal.fg_dim
-            },
+            pal.fg_dim.lerp(pal.fg, snap.hover_level(&target, hov)),
+            snap.icon_time(hov),
         );
         hits.push(HitZone { rect, target });
     }
 
     // ── 2. Sidebar Navigation ────────────────────────────────────────────────
-    let brand_tile = Rect::new(16.0, 12.0, 26.0, 26.0);
-    dl.fill_rect_bordered(
-        brand_tile,
-        7.0,
-        Rgba::rgb(17, 17, 17),
-        1.0,
-        Rgba::rgba(255, 255, 255, 36),
+    let brand_icon = Rect::new(15.0, 12.0, 26.0, 26.0);
+    draw_centered_icon(dl, te, IconId::Brand, brand_icon, 23.0, pal.fg);
+    dl.draw_text_vcentered(
+        te,
+        46.0,
+        25.0,
+        16.0,
+        pal.fg,
+        FontWeight::Bold,
+        None,
+        crate::APP_NAME,
     );
-    draw_centered_icon(dl, te, IconId::Brand, brand_tile, 20.0, Rgba::rgb(255, 255, 255));
-    dl.draw_text_vcentered(te, 50.0, 25.0, 15.0, pal.fg, FontWeight::Bold, None, "Enio");
 
     let nav_items = [
         (AppView::Dictate, IconId::Mic, "Dictate"),
@@ -643,17 +1215,21 @@ pub fn render_main_window(
         let active = snap.view == v;
         let hov = nrect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
         if active {
-            dl.fill_rect_bordered(nrect, 8.0, pal.bg_element, 1.0, pal.seam);
+            dl.fill_rect(nrect, 6.0, pal.bg_element);
         } else if hov {
-            dl.fill_rect(nrect, 8.0, pal.bg_hover);
+            dl.fill_rect(
+                nrect,
+                6.0,
+                pal.bg_hover.with_alpha((255.0 * snap.hover_t) as u8),
+            );
         }
-        dl.draw_icon(
+        dl.draw_animated_icon(
             te,
             icon,
-            22.0,
-            ny + 8.5,
+            Rect::new(22.0, ny + 8.5, 15.0, 15.0),
             15.0,
             if active || hov { pal.fg } else { pal.fg_muted },
+            snap.icon_time(hov),
         );
         dl.draw_text_vcentered(
             te,
@@ -676,7 +1252,7 @@ pub fn render_main_window(
     }
 
     // Sidebar: Installed Local Models quick-switcher
-    let installed_ids = installed_local_models(snap.paths);
+    let installed_ids = &snap.inventory.installed;
     if !installed_ids.is_empty() {
         let sec_y = 140.0;
         dl.draw_text(
@@ -699,9 +1275,13 @@ pub fn render_main_window(
             let is_cur = snap.config.backend == "local" && &snap.config.local_model == mid;
             let hov = mrect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
             if is_cur {
-                dl.fill_rect_bordered(mrect, 7.0, pal.bg_element, 1.0, pal.seam);
+                dl.fill_rect(mrect, 6.0, pal.bg_element);
             } else if hov {
-                dl.fill_rect(mrect, 7.0, pal.bg_hover);
+                dl.fill_rect(
+                    mrect,
+                    6.0,
+                    pal.bg_hover.with_alpha((255.0 * snap.hover_t) as u8),
+                );
             }
             dl.fill_circle(
                 mrect.x + 12.0,
@@ -721,7 +1301,7 @@ pub fn render_main_window(
                     FontWeight::Regular
                 },
                 Some(mrect.w - 28.0),
-                mid,
+                find_local_whisper_spec(mid).map_or(mid.as_str(), |spec| spec.name()),
             );
             hits.push(HitZone {
                 rect: mrect,
@@ -737,17 +1317,21 @@ pub fn render_main_window(
         let active = snap.view == AppView::Settings;
         let hov = srect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
         if active {
-            dl.fill_rect_bordered(srect, 8.0, pal.bg_element, 1.0, pal.seam);
+            dl.fill_rect(srect, 6.0, pal.bg_element);
         } else if hov {
-            dl.fill_rect(srect, 8.0, pal.bg_hover);
+            dl.fill_rect(
+                srect,
+                6.0,
+                pal.bg_hover.with_alpha((255.0 * snap.hover_t) as u8),
+            );
         }
-        dl.draw_icon(
+        dl.draw_animated_icon(
             te,
             IconId::Settings,
-            22.0,
-            sy + 8.5,
+            Rect::new(22.0, sy + 8.5, 15.0, 15.0),
             15.0,
             if active || hov { pal.fg } else { pal.fg_muted },
+            snap.icon_time(hov),
         );
         dl.draw_text_vcentered(
             te,
@@ -771,39 +1355,64 @@ pub fn render_main_window(
 
     // Sidebar bottom status footer (scannable, quiet)
     let runtime_ready = if snap.config.backend == "local" {
-        is_local_engine_ready(snap.paths, snap.config)
+        snap.inventory.is_ready(&snap.config.local_model)
     } else {
         snap.config.has_api_key(&snap.config.backend)
     };
-    let foot_y = h - 76.0;
-    let status_rect = Rect::new(12.0, foot_y, sidebar_w - 24.0, 62.0);
-    dl.fill_rect_bordered(status_rect, 10.0, pal.bg_panel, 1.0, pal.seam);
-    dl.fill_circle(
-        status_rect.x + 14.0,
-        status_rect.y + 19.0,
-        4.0,
-        if runtime_ready { pal.success } else { pal.warning },
+    let summary = if snap.config.backend == "local" {
+        find_local_whisper_spec(&snap.config.local_model)
+            .map_or(snap.config.local_model.as_str(), |spec| spec.name())
+            .to_owned()
+    } else {
+        snap.config.active_summary()
+    };
+    let status_rect = Rect::new(10.0, h - 68.0, sidebar_w - 20.0, 53.0);
+    let hovered = status_rect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
+    dl.fill_rect(
+        Rect::new(19.0, status_rect.y - 4.0, sidebar_w - 38.0, 1.0),
+        0.0,
+        pal.seam,
     );
+    if hovered {
+        dl.fill_rect(
+            status_rect,
+            6.0,
+            pal.bg_hover.with_alpha((255.0 * snap.hover_t) as u8),
+        );
+    }
     dl.draw_text_vcentered(
         te,
-        status_rect.x + 24.0,
-        status_rect.y + 19.0,
+        20.0,
+        status_rect.y + 16.0,
         12.5,
         pal.fg,
         FontWeight::Semibold,
-        Some(status_rect.w - 32.0),
-        &snap.config.active_summary(),
+        Some(status_rect.w - 22.0),
+        &summary,
     );
-    dl.draw_text(
+    dl.fill_circle(
+        23.0,
+        status_rect.y + 36.0,
+        3.0,
+        if runtime_ready {
+            pal.success
+        } else {
+            pal.warning
+        },
+    );
+    dl.draw_text_vcentered(
         te,
-        status_rect.x + 12.0,
-        status_rect.y + 35.0,
+        33.0,
+        status_rect.y + 36.0,
         11.5,
-        pal.fg_dim,
+        pal.fg_muted,
         FontWeight::Regular,
-        Some(status_rect.w - 24.0),
-        1,
-        "Ctrl+Shift+Space anywhere",
+        None,
+        if runtime_ready {
+            "Model ready"
+        } else {
+            "Setup required"
+        },
     );
     hits.push(HitZone {
         rect: status_rect,
@@ -815,9 +1424,15 @@ pub fn render_main_window(
         sidebar_w + 1.0,
         titlebar_h,
         w - sidebar_w - 1.0,
-        h - titlebar_h,
+        h - titlebar_h
+            - if snap.status_toast.is_some() {
+                34.0
+            } else {
+                0.0
+            },
     );
 
+    let page_first = dl.instances.len();
     match snap.view {
         AppView::Dictate => render_dictate_view(
             dl,
@@ -835,14 +1450,22 @@ pub fn render_main_window(
         }
     }
 
-    // Subtle 1px outer border around the frameless window
-    dl.fill_rect_bordered(
-        Rect::new(0.0, 0.0, w, h),
-        0.0,
-        Rgba::transparent(),
-        1.0,
-        pal.seam,
-    );
+    dl.fade_from(page_first, 0.62 + 0.38 * snap.page_t);
+
+    if let Some(message) = snap.status_toast {
+        let footer = Rect::new(content.x, h - 34.0, content.w, 34.0);
+        dl.fill_rect(Rect::new(footer.x, footer.y, footer.w, 1.0), 0.0, pal.seam);
+        dl.draw_text_vcentered(
+            te,
+            footer.x + 18.0,
+            footer.y + 16.0,
+            12.5,
+            pal.fg_muted,
+            FontWeight::Regular,
+            Some(footer.w - 36.0),
+            message,
+        );
+    }
 
     // Paint floating icon tooltip on top of main UI when no modal is blocking
     if matches!(snap.modal, Modal::None) {
@@ -852,8 +1475,10 @@ pub fn render_main_window(
     }
 
     // ── 4. Modals (Provider Config, Download Confirm, Delete Clip Confirm) ───
+    let modal_first = dl.instances.len();
     match snap.modal {
         Modal::None => {}
+        Modal::Downloads => render_downloads_popover(dl, te, &mut hits, &pal, snap),
         Modal::ProviderConfig {
             provider_id,
             provider_name,
@@ -863,43 +1488,48 @@ pub fn render_main_window(
             api_key,
             active_field,
             reveal_key,
-        } => {
-            render_provider_config_modal(
-                dl,
-                te,
-                &mut hits,
-                &pal,
-                snap,
-                provider_id,
-                provider_name,
-                *is_self_hosted,
-                base_url,
-                model_id,
-                api_key,
-                *active_field,
-                *reveal_key,
-            );
-        }
-        Modal::ConfirmDownload {
-            label,
-            size_mb,
-            engine_name,
             ..
         } => {
-            render_confirm_download_modal(
-                dl,
-                te,
-                &mut hits,
-                &pal,
-                snap,
-                label,
-                *size_mb,
-                engine_name,
-            );
+            te.with_uncached_layouts(|te| {
+                render_provider_config_modal(
+                    dl,
+                    te,
+                    &mut hits,
+                    &pal,
+                    snap,
+                    provider_id,
+                    provider_name,
+                    *is_self_hosted,
+                    base_url,
+                    model_id,
+                    api_key,
+                    *active_field,
+                    *reveal_key,
+                );
+            });
+        }
+        Modal::ConfirmDownload(target) => {
+            render_confirm_download_modal(dl, te, &mut hits, &pal, snap, target)
         }
         Modal::ConfirmDeleteClip { preview, .. } => {
             render_confirm_delete_modal(dl, te, &mut hits, &pal, snap, preview);
         }
+        Modal::Transcript { id, scroll, copied } => {
+            if let Some(entry) = snap.history.iter().find(|entry| &entry.id == id) {
+                render_transcript_modal(dl, te, &mut hits, &pal, snap, entry, *scroll, *copied);
+            }
+        }
+    }
+
+    dl.fade_from(modal_first, 0.38 + 0.62 * snap.modal_t);
+    if let Some(border) = snap.window_border {
+        dl.fill_rect_bordered(
+            Rect::new(0.0, 0.0, w, h),
+            0.0,
+            Rgba::transparent(),
+            1.0 / dl.scale,
+            border,
+        );
     }
 
     hits
@@ -918,225 +1548,178 @@ fn render_dictate_view(
 ) {
     let col_w = (area.w - 56.0).clamp(360.0, 720.0);
     let col_x = area.x + (area.w - col_w) * 0.5;
-    let is_rec = matches!(snap.phase, DictationPhase::Recording);
+    let is_recording = matches!(snap.phase, DictationPhase::Recording);
+    let is_processing = matches!(snap.phase, DictationPhase::Transcribing);
 
-    // ── Agente Code Composer Sheet (--composer-radius: 12px, #252527, 1px ring) ─
-    let pill_y = area.y + 20.0;
-    let pill_h = 130.0;
-    let pill = Rect::new(col_x, pill_y, col_w, pill_h);
-    dl.fill_rect_bordered(
-        pill,
+    dl.draw_text(
+        te,
+        col_x,
+        area.y + 19.0,
+        25.0,
+        pal.fg,
+        FontWeight::Bold,
+        None,
+        1,
+        "Dictate",
+    );
+    let shortcut = Rect::new(col_x + col_w - 147.0, area.y + 20.0, 147.0, 28.0);
+    dl.draw_text_centered(
+        te,
+        shortcut,
         12.0,
-        pal.bg_composer,
-        1.0,
-        if is_rec { pal.accent } else { pal.ring },
+        pal.fg_muted,
+        FontWeight::Semibold,
+        "Ctrl + Shift + Space",
     );
 
-    // Top section of composer sheet: waveform while recording, calm prompt when idle
-    if is_rec {
-        let mins = snap.elapsed_secs / 60;
-        let secs = snap.elapsed_secs % 60;
-        dl.fill_circle(pill.x + 26.0, pill.y + 30.0, 4.5, pal.accent);
-        let vad_note = if snap.vad_speaking {
-            "  ·  voice active"
-        } else {
-            ""
-        };
-        dl.draw_text_vcentered(
-            te,
-            pill.x + 38.0,
-            pill.y + 30.0,
-            14.5,
-            pal.fg,
-            FontWeight::Bold,
-            None,
-            &format!("Listening  ·  {mins}:{secs:02}{vad_note}"),
-        );
+    let pill = Rect::new(col_x, area.y + 63.0, col_w, 118.0);
+    dl.fill_rect_bordered(
+        pill, 12.0, pal.bg_composer, 1.0,
+        if is_recording { pal.accent.with_alpha(110) } else { pal.ring },
+    );
 
-        let wave_x = pill.x + 22.0;
-        let wave_w = pill.w - 44.0;
-        let wave_cy = pill.y + 62.0;
-        let num_bars = HISTORY_BARS.min((wave_w / 7.5).floor() as usize).max(18);
-        let step = wave_w / num_bars as f32;
-        let bar_w = (step * 0.5).clamp(2.5, 4.0);
-        let slice_start = snap.history_bars.len().saturating_sub(num_bars);
-        for (i, &val) in snap.history_bars[slice_start..].iter().enumerate() {
-            let v = val.clamp(0.0, 1.0);
-            let bh = (4.0 + v * 26.0).min(30.0);
-            let bx = wave_x + i as f32 * step;
-            let col = pal.accent_soft.lerp(pal.accent, (v * 1.4).clamp(0.0, 1.0));
-            dl.fill_rect(
-                Rect::new(bx, wave_cy - bh * 0.5, bar_w, bh),
-                bar_w * 0.5,
-                col,
-            );
-        }
-    } else {
-        let (headline, headline_color) = match snap.phase {
-            DictationPhase::Transcribing => ("Transcribing speech…".to_string(), pal.warning),
-            DictationPhase::Installing { label, progress } => {
-                (format!("{label} ({progress}%)"), pal.accent)
-            }
-            DictationPhase::Error(err) => (err.clone(), pal.error),
-            _ => {
-                if !snap.live_preview.trim().is_empty() {
-                    (snap.live_preview.to_string(), pal.fg_prose)
-                } else {
-                    (
-                        "Press Ctrl+Shift+Space in any app, or click the mic to dictate…"
-                            .to_string(),
-                        pal.fg_dim,
-                    )
-                }
-            }
-        };
-        dl.draw_text(
-            te,
-            pill.x + 22.0,
-            pill.y + 24.0,
-            15.5,
-            headline_color,
-            FontWeight::Regular,
-            Some(pill.w - 44.0),
-            2,
-            &headline,
-        );
-    }
-
-    // Bottom bar inside composer sheet: quiet 32px chips left, single 34px round mic right
-    let bar_y = pill.y + pill_h - 44.0;
-    let mut cx = pill.x + 14.0;
-
-    let model_chip_x = cx;
-    let short_model = if snap.config.backend == "local" {
-        format!(
-            "{} {}",
-            snap.config.local_model,
-            if snap.model_dropdown_open { "▴" } else { "▾" }
-        )
-    } else {
-        format!(
-            "{} {}",
-            snap.config.commercial_model,
-            if snap.model_dropdown_open { "▴" } else { "▾" }
-        )
-    };
-    cx += draw_chip(
-        dl,
-        te,
-        hits,
-        pal,
-        cx,
-        bar_y,
-        30.0,
-        &short_model,
-        snap.model_dropdown_open,
-        HitTarget::ToggleModelDropdown,
-        snap.mouse_pos,
-        snap.hover_t,
-        snap.pressed_target,
-    ) + 4.0;
-
-    cx += draw_chip(
-        dl,
-        te,
-        hits,
-        pal,
-        cx,
-        bar_y,
-        30.0,
-        &snap.config.language,
-        false,
-        HitTarget::CycleLanguage,
-        snap.mouse_pos,
-        snap.hover_t,
-        snap.pressed_target,
-    ) + 4.0;
-
-    let delivery_short = match snap.config.delivery_mode {
-        crate::config::DeliveryMode::PasteAndClipboard => "Auto-Paste",
-        crate::config::DeliveryMode::TypeAndClipboard => "Auto-Type",
-        crate::config::DeliveryMode::ClipboardOnly => "Clipboard",
-    };
-    cx += draw_chip(
-        dl,
-        te,
-        hits,
-        pal,
-        cx,
-        bar_y,
-        30.0,
-        delivery_short,
-        false,
-        HitTarget::CycleDelivery,
-        snap.mouse_pos,
-        snap.hover_t,
-        snap.pressed_target,
-    ) + 4.0;
-
-    if !runtime_ready {
-        let action_lbl = if snap.config.backend == "local" {
-            "Install Engine"
-        } else {
-            "Set Key"
-        };
-        let action_target = if snap.config.backend == "local" {
-            HitTarget::InstallLocalEngine
-        } else {
-            HitTarget::OpenProviderConfig(snap.config.backend.clone())
-        };
-        let _ = draw_chip(
-            dl,
-            te,
-            hits,
-            pal,
-            cx,
-            bar_y,
-            30.0,
-            action_lbl,
-            true,
-            action_target,
-            snap.mouse_pos,
-            snap.hover_t,
-            snap.pressed_target,
-        );
-    }
-
-    // 34px round Mic / Stop button on the hard right (monochrome white CTA when idle, orange when recording)
-    let btn_r = 16.0;
-    let btn_cx = pill.x + pill.w - 28.0;
-    let mic_pressed = snap.pressed_target == Some(&HitTarget::ToggleRecord);
-    let btn_cy = bar_y + 15.0 + if mic_pressed { 1.0 } else { 0.0 };
-    let btn_rect = Rect::new(btn_cx - btn_r, btn_cy - btn_r, btn_r * 2.0, btn_r * 2.0);
-    let btn_hov = btn_rect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
-    let ht = if btn_hov { snap.hover_t } else { 0.0 };
-    let btn_fill = if is_rec {
-        pal.accent
-    } else if mic_pressed {
-        pal.bg_active
-    } else {
-        pal.primary.lerp(pal.primary_hover, ht)
-    };
-    dl.fill_circle(btn_cx, btn_cy, btn_r, btn_fill);
-    if is_rec {
-        draw_centered_icon(dl, te, IconId::Square, btn_rect, 13.0, Rgba::rgb(255, 255, 255));
-    } else {
-        draw_centered_icon(dl, te, IconId::Mic, btn_rect, 15.0, pal.primary_fg);
-    }
-    if btn_hov && !snap.model_dropdown_open {
-        *tooltip = Some((
-            btn_rect,
-            if is_rec {
-                "Stop & transcribe (Space)"
-            } else {
-                "Start dictation (Space)"
-            },
-        ));
-    }
-    hits.push(HitZone {
-        rect: btn_rect,
-        target: HitTarget::ToggleRecord,
+    let local = snap.config.backend == "local";
+    let card_first = dl.instances.len();
+    let setup = snap.download.filter(|job| {
+        local && !runtime_ready
+            && job.target.model_id() == Some(snap.config.local_model.as_str())
+            && !matches!(job.state, DownloadState::Completed | DownloadState::Canceled)
     });
+    let (title, detail) = match (snap.phase, setup) {
+        (DictationPhase::Recording, _) => {
+            let minutes = snap.elapsed_secs / 60;
+            let seconds = snap.elapsed_secs % 60;
+            let detail = if snap.vad_speaking { "Voice detected" } else { "Microphone is on" };
+            (format!("Listening · {minutes}:{seconds:02}"), detail)
+        }
+        (DictationPhase::Transcribing, _) => (
+            "Transcribing…".into(),
+            "Turning your audio into text",
+        ),
+        (_, Some(job)) => (job.name().to_owned(), job.label()),
+        (DictationPhase::Error(error), _) => ("Dictation needs attention".into(), error.as_str()),
+        _ if !runtime_ready && local => (
+            "Set up dictation".into(),
+            "Download a speech model to start dictating on this device.",
+        ),
+        _ if !runtime_ready => (
+            "Connect your provider".into(),
+            "Add your provider credentials to start dictating.",
+        ),
+        _ => ("Ready to record".into(), "Record here and get the text on your clipboard."),
+    };
+
+    let text_x = pill.x + 17.0;
+    let title_y = pill.y + 23.0;
+    let title_x = if is_recording {
+        dl.fill_circle(text_x + 3.0, title_y, 3.0, pal.accent);
+        text_x + 15.0
+    } else if is_processing {
+        dl.draw_rotating_icon(
+            te, IconId::Loader, Rect::new(text_x, title_y - 8.0, 16.0, 16.0),
+            14.0, pal.fg_muted, snap.spinner_angle,
+        );
+        text_x + 23.0
+    } else {
+        text_x
+    };
+    let progress = setup.and_then(|job| job.progress).filter(|_| !is_recording && !is_processing);
+    let progress_label = progress.map(|progress| progress.label());
+    let progress_width = progress_label.as_ref()
+        .map_or(0.0, |label| te.measure(label, 11.5, FontWeight::Regular) + 12.0);
+    dl.draw_text_vcentered(
+        te, title_x, title_y, 15.5, pal.fg, FontWeight::Bold,
+        Some(pill.x + pill.w - 17.0 - title_x), &title,
+    );
+    dl.draw_text(
+        te, text_x, pill.y + 34.0, 12.5, pal.fg_muted, FontWeight::Regular,
+        Some(pill.w - 34.0 - progress_width), if progress.is_some() { 1 } else { 2 }, detail,
+    );
+    if let Some(label) = progress_label {
+        dl.draw_text(
+            te, pill.x + pill.w - 5.0 - progress_width, pill.y + 35.0, 11.5,
+            pal.fg_muted, FontWeight::Regular, None, 1, &label,
+        );
+        draw_download_bar(
+            dl, pal, Rect::new(text_x, pill.y + 57.0, pill.w - 34.0, 3.0), snap.download_fraction,
+        );
+    }
+
+    let bar_y = pill.y + 72.0;
+    let mut right = pill.x + pill.w - 12.0;
+    let action = match snap.phase {
+        DictationPhase::Transcribing => None,
+        DictationPhase::Recording => Some(("Stop recording", IconId::Square, HitTarget::ToggleRecord)),
+        _ if setup.is_some() => Some(("View download", IconId::Download, HitTarget::ToggleDownloads)),
+        _ if !runtime_ready && local => Some((
+            "Set up model", IconId::Download, HitTarget::DownloadLocalModel(snap.config.local_model.clone()),
+        )),
+        _ if !runtime_ready => Some((
+            "Configure", IconId::Settings, HitTarget::OpenProviderConfig(snap.config.backend.clone()),
+        )),
+        _ => Some(("Record", IconId::Mic, HitTarget::ToggleRecord)),
+    };
+    if let Some((label, icon, target)) = action {
+        right -= (te.measure(label, 12.5, FontWeight::Bold) + 28.0 + BUTTON_ICON_SPAN).max(84.0);
+        draw_labeled_button(
+            dl, te, hits, pal, right, bar_y, 34.0, label, ModalBtnTone::Primary,
+            target, snap.mouse_pos, snap.hover_t, snap.pressed_target, Some((icon, snap.icon_hover_ms)),
+        );
+    }
+
+    let first_menu_hit = hits.len();
+    if is_recording {
+        let cancel_x = pill.x + 10.0;
+        let cancel_w = draw_chip(
+            dl, te, hits, pal, cancel_x, bar_y, 34.0, 88.0, "Cancel", false,
+            HitTarget::CancelRecording, snap.mouse_pos, snap.hover_t, snap.pressed_target,
+        );
+        draw_recording_waveform(
+            dl, pal, Rect::new(cancel_x + cancel_w + 10.0, bar_y, right - cancel_x - cancel_w - 22.0, 34.0),
+            snap.history_bars,
+        );
+    } else if is_processing {
+        let width = (te.measure("Cancel", 12.5, FontWeight::Semibold) + 18.0).max(44.0);
+        draw_chip(
+            dl, te, hits, pal, right - width, bar_y, 34.0, width, "Cancel", false,
+            HitTarget::CancelRecording, snap.mouse_pos, snap.hover_t, snap.pressed_target,
+        );
+    } else {
+        let model = if local {
+            find_local_whisper_spec(&snap.config.local_model).map_or(snap.config.local_model.as_str(), |spec| {
+                spec.name().split('(').next().unwrap_or(spec.name()).trim()
+            })
+        } else {
+            find_commercial_provider(&snap.config.backend).map_or(snap.config.backend.as_str(), |provider| provider.name)
+        };
+        let menus = [
+            (model, 150.0, ComposerMenu::Models),
+            (DictateConfig::language_label(&snap.config.language), 116.0, ComposerMenu::Language),
+            (snap.config.delivery_mode.short_label(), 96.0, ComposerMenu::Delivery),
+        ].map(|(label, max_width, menu)| {
+            let open = snap.composer_menu == Some(menu);
+            let label = format!("{} {label}", if open { "▴" } else { "▾" });
+            let weight = if open { FontWeight::Bold } else { FontWeight::Semibold };
+            let width = (te.measure(&label, 12.5, weight) + 18.0).clamp(44.0, max_width);
+            (label, width, menu, open)
+        });
+        let gaps = 8.0;
+        let minimum = 44.0 * menus.len() as f32;
+        let desired = menus.iter().map(|(_, width, _, _)| width).sum::<f32>();
+        let mut x = pill.x + 10.0;
+        let extra = desired - minimum;
+        let room = (right - 10.0 - x - gaps - minimum).max(0.0);
+        let fit = if extra > 0.0 { (room / extra).min(1.0) } else { 1.0 };
+        for (label, width, menu, open) in menus {
+            x += draw_chip(
+                dl, te, hits, pal, x, bar_y, 34.0, 44.0 + (width - 44.0) * fit,
+                &label, open, HitTarget::ToggleComposerMenu(menu),
+                snap.mouse_pos, snap.hover_t, snap.pressed_target,
+            ) + 4.0;
+        }
+    }
+    let last_menu_hit = hits.len();
+    dl.fade_from(card_first, 0.60 + 0.40 * snap.dictation_t);
 
     // ── Transcript History List (clean edge-aligned rows, no boxes-on-boxes) ─
     let list_header_y = pill.y + pill.h + 26.0;
@@ -1149,22 +1732,8 @@ fn render_dictate_view(
         FontWeight::Bold,
         None,
         1,
-        &format!("Recent ({})", snap.history.len()),
+        &format!("History ({})", snap.history.len()),
     );
-    if let Some(toast) = snap.status_toast {
-        let tw = te.measure(toast, 12.5, FontWeight::Regular);
-        dl.draw_text(
-            te,
-            col_x + col_w - tw - 4.0,
-            list_header_y,
-            12.5,
-            pal.fg_dim,
-            FontWeight::Regular,
-            None,
-            1,
-            toast,
-        );
-    }
 
     let mut cur_y = list_header_y + 26.0;
     let bottom = area.y + area.h - 18.0;
@@ -1175,11 +1744,11 @@ fn render_dictate_view(
             col_x + 4.0,
             cur_y + 6.0,
             13.5,
-            pal.fg_dim,
+            pal.fg_muted,
             FontWeight::Regular,
             Some(col_w - 8.0),
             2,
-            "Your dictations appear here. Use Ctrl+Shift+Space from any window to speak directly into editors, browsers, or chat inputs.",
+            "Your transcripts appear here, ready to open or copy.",
         );
     } else {
         let start = snap.history_scroll.min(snap.history.len().saturating_sub(1));
@@ -1210,7 +1779,7 @@ fn render_dictate_view(
             }
             hits.push(HitZone {
                 rect: rrect,
-                target: HitTarget::SelectHistory(idx),
+                target: HitTarget::OpenHistory(entry.id.clone()),
             });
 
             // Transcript body
@@ -1229,11 +1798,12 @@ fn render_dictate_view(
             // Quiet metadata row underneath
             let meta_y = rrect.y + row_h - 22.0;
             let meta = format!(
-                "{}  ·  {}  ·  {:.1}s  ·  {}ms",
-                entry.created_at.format("%H:%M"),
-                entry.model,
+                "{}  ·  {:.1}s",
+                entry
+                    .created_at
+                    .with_timezone(&chrono::Local)
+                    .format("%b %e, %H:%M"),
                 entry.duration_secs,
-                entry.elapsed_ms
             );
             dl.draw_text(
                 te,
@@ -1247,13 +1817,21 @@ fn render_dictate_view(
                 &meta,
             );
 
-            // Inline quiet SVG icon actions on hover or selection (mathematically centered + tooltips)
-            if is_hov || is_sel {
+            {
                 let mut ax = rrect.x + rrect.w - 8.0;
                 for (icon, target, is_del, tip) in [
-                    (IconId::Trash, HitTarget::RequestDeleteHistory(idx), true, "Delete clip"),
-                    (IconId::Globe, HitTarget::TypeHistory(idx), false, "Type into active window"),
-                    (IconId::Copy, HitTarget::CopyHistory(idx), false, "Copy to clipboard"),
+                    (
+                        IconId::Trash,
+                        HitTarget::RequestDeleteHistory(entry.id.clone()),
+                        true,
+                        "Delete transcript",
+                    ),
+                    (
+                        IconId::Copy,
+                        HitTarget::CopyHistory(entry.id.clone()),
+                        false,
+                        "Copy transcript",
+                    ),
                 ] {
                     let bw = 26.0;
                     ax -= bw;
@@ -1261,12 +1839,11 @@ fn render_dictate_view(
                     let ahov = arect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
                     if ahov {
                         dl.fill_rect(arect, 6.0, pal.bg_hover);
-                        if !snap.model_dropdown_open {
+                        if snap.composer_menu.is_none() {
                             *tooltip = Some((arect, tip));
                         }
                     }
-                    draw_centered_icon(
-                        dl,
+                    dl.draw_animated_icon(
                         te,
                         icon,
                         arect,
@@ -1278,6 +1855,7 @@ fn render_dictate_view(
                         } else {
                             pal.fg_dim
                         },
+                        snap.icon_time(ahov),
                     );
                     hits.push(HitZone { rect: arect, target });
                     ax -= 4.0;
@@ -1313,8 +1891,103 @@ fn render_dictate_view(
     }
 
     // Floating Model Selector Dropdown anchored under the composer pill model chip
-    if snap.model_dropdown_open {
-        render_model_dropdown(dl, te, hits, pal, snap, model_chip_x, bar_y + 34.0);
+    if let Some(menu) = snap.composer_menu.filter(|_| !is_recording && !is_processing) {
+        let popup_first = dl.instances.len();
+        let anchor_x = hits[first_menu_hit..last_menu_hit]
+            .iter()
+            .find(|zone| zone.target == HitTarget::ToggleComposerMenu(menu))
+            .map_or(pill.x + 12.0, |zone| zone.rect.x);
+        hits.push(HitZone {
+            rect: Rect::new(0.0, 0.0, snap.width, snap.height),
+            target: HitTarget::CloseComposerMenu,
+        });
+        hits.extend_from_within(first_menu_hit..last_menu_hit);
+        let y = bar_y + 39.0;
+        match menu {
+            ComposerMenu::Models => render_model_dropdown(dl, te, hits, pal, snap, anchor_x, y),
+            ComposerMenu::Language => {
+                let choices: Vec<_> = LANGUAGES
+                    .iter()
+                    .map(|&code| {
+                        (
+                            DictateConfig::language_label(code),
+                            HitTarget::SetLanguage(code),
+                            snap.config.language == code,
+                        )
+                    })
+                    .collect();
+                render_composer_choices(dl, te, hits, pal, snap, anchor_x, y, 138.0, 2, &choices);
+            }
+            ComposerMenu::Delivery => {
+                let choices = [
+                    DeliveryMode::PasteAndClipboard,
+                    DeliveryMode::TypeAndClipboard,
+                    DeliveryMode::ClipboardOnly,
+                ]
+                .map(|mode| {
+                    (
+                        mode.label(),
+                        HitTarget::SetDelivery(mode),
+                        snap.config.delivery_mode == mode,
+                    )
+                });
+                render_composer_choices(dl, te, hits, pal, snap, anchor_x, y, 251.0, 1, &choices);
+            }
+        }
+        dl.fade_from(popup_first, 0.40 + 0.60 * snap.popup_t);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_composer_choices(
+    dl: &mut DrawList,
+    te: &mut TextEngine,
+    hits: &mut Vec<HitZone>,
+    pal: &Palette,
+    snap: &UiSnapshot<'_>,
+    x: f32,
+    y: f32,
+    cell_width: f32,
+    columns: usize,
+    choices: &[(&str, HitTarget, bool)],
+) {
+    let rows = choices.len().div_ceil(columns);
+    let width = cell_width * columns as f32 + 12.0;
+    let x = x.min(snap.width - width - 16.0);
+    let panel = Rect::new(x, y, width, rows as f32 * 29.0 + 12.0);
+    draw_floating_surface(dl, pal, panel, 10.0);
+    for (index, (label, target, selected)) in choices.iter().enumerate() {
+        let rect = Rect::new(
+            x + 6.0 + (index / rows) as f32 * cell_width,
+            y + 6.0 + (index % rows) as f32 * 29.0,
+            cell_width,
+            28.0,
+        );
+        if *selected || rect.contains(snap.mouse_pos.0, snap.mouse_pos.1) {
+            dl.fill_rect(
+                rect,
+                6.0,
+                if *selected {
+                    pal.bg_active
+                } else {
+                    pal.bg_hover
+                },
+            );
+        }
+        dl.draw_text_vcentered(
+            te,
+            rect.x + 10.0,
+            rect.y + 14.0,
+            12.5,
+            pal.fg,
+            FontWeight::Regular,
+            Some(rect.w - 20.0),
+            label,
+        );
+        hits.push(HitZone {
+            rect,
+            target: target.clone(),
+        });
     }
 }
 
@@ -1329,13 +2002,7 @@ fn render_model_dropdown(
 ) {
     use crate::catalog::COMMERCIAL_STT_PROVIDERS;
 
-    // Click-outside catcher behind the dropdown panel
-    hits.push(HitZone {
-        rect: Rect::new(0.0, 0.0, snap.width, snap.height),
-        target: HitTarget::CloseModelDropdown,
-    });
-
-    let installed = installed_local_models(snap.paths);
+    let installed = &snap.inventory.installed;
     let mut ready_cloud: Vec<(&'static str, &'static str, String)> = Vec::new();
     for prov in COMMERCIAL_STT_PROVIDERS {
         if snap.config.has_api_key(prov.id) {
@@ -1367,7 +2034,7 @@ fn render_model_dropdown(
     let dh = dh.min(max_h);
 
     let drect = Rect::new(dx, anchor_y, dw, dh);
-    dl.fill_rect_bordered(drect, 12.0, pal.bg_popover, 1.0, pal.ring);
+    draw_floating_surface(dl, pal, drect, 10.0);
 
     let mut y = drect.y + 8.0;
     if !installed.is_empty() {
@@ -1537,28 +2204,33 @@ fn render_models_view(
     dl.draw_text(
         te,
         col_x,
-        area.y + 12.0,
-        18.0,
+        area.y + 19.0,
+        25.0,
         pal.fg,
         FontWeight::Bold,
         None,
         1,
-        "Speech Models",
+        "Models",
     );
-    dl.draw_text(
+    let label = "Speech engines";
+    let width = te.measure(label, 12.5, FontWeight::Semibold) + 28.0;
+    draw_modal_button(
+        dl,
         te,
-        col_x,
-        area.y + 38.0,
-        13.0,
-        pal.fg_dim,
-        FontWeight::Regular,
-        None,
-        1,
-        "On-device Non-Whisper (Qwen3-ASR, Parakeet, SenseVoice, Moonshine), Whisper GGML, Hugging Face, and 15 Commercial STT APIs.",
+        hits,
+        pal,
+        col_x + col_w - width,
+        area.y + 20.0,
+        31.0,
+        label,
+        ModalBtnTone::Secondary,
+        HitTarget::OpenEngineSettings,
+        snap.mouse_pos,
+        snap.hover_t,
+        snap.pressed_target,
     );
 
-    // Interactive Search bar (--radius-input: 6px, monochrome focus ring)
-    let search_rect = Rect::new(col_x, area.y + 68.0, col_w, 34.0);
+    let search_rect = Rect::new(col_x, area.y + 62.0, col_w, 34.0);
     let search_hov = search_rect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
     let search_focused = snap.model_search_focused;
     let search_fill = if search_focused {
@@ -1568,25 +2240,23 @@ fn render_models_view(
     } else {
         pal.bg_panel
     };
-    let search_border = if search_focused {
-        pal.ring_focus
-    } else if search_hov {
-        pal.ring
-    } else {
-        pal.seam
-    };
-    dl.fill_rect_bordered(
-        search_rect,
-        6.0,
-        search_fill,
-        1.0,
-        search_border,
-    );
-    dl.draw_icon(
+    dl.fill_rect(search_rect, 6.0, search_fill);
+    if search_focused {
+        dl.fill_rect(
+            Rect::new(
+                col_x + 6.0,
+                search_rect.y + search_rect.h - 1.0,
+                col_w - 12.0,
+                1.0,
+            ),
+            0.0,
+            pal.ring_focus,
+        );
+    }
+    dl.draw_animated_icon(
         te,
         IconId::Search,
-        search_rect.x + 11.0,
-        search_rect.y + 9.5,
+        Rect::new(search_rect.x + 11.0, search_rect.y + 9.5, 15.0, 15.0),
         15.0,
         if search_focused {
             pal.fg
@@ -1595,6 +2265,7 @@ fn render_models_view(
         } else {
             pal.fg_dim
         },
+        snap.icon_time(search_hov),
     );
 
     let text_x = search_rect.x + 34.0;
@@ -1654,13 +2325,13 @@ fn render_models_view(
             dl.fill_rect(clear_rect, 6.0, pal.bg_hover);
             *tooltip = Some((clear_rect, "Clear filter"));
         }
-        draw_centered_icon(
-            dl,
+        dl.draw_animated_icon(
             te,
             IconId::Close,
             clear_rect,
             14.0,
             if clear_hov { pal.fg } else { pal.fg_muted },
+            snap.icon_time(clear_hov),
         );
         hits.push(HitZone {
             rect: clear_rect,
@@ -1678,8 +2349,18 @@ fn render_models_view(
         ModelFilterTab::Commercial,
     ];
     let mut tx = col_x;
-    let ty = area.y + 114.0;
+    let mut ty = area.y + 106.0;
     for tab in tabs {
+        let weight = if snap.model_tab == tab {
+            FontWeight::Bold
+        } else {
+            FontWeight::Semibold
+        };
+        let width = (te.measure(tab.label(), 12.5, weight) + 18.0).max(44.0);
+        if tx + width > col_x + col_w && tx > col_x {
+            tx = col_x;
+            ty += 31.0;
+        }
         tx += draw_chip(
             dl,
             te,
@@ -1688,6 +2369,7 @@ fn render_models_view(
             tx,
             ty,
             28.0,
+            f32::INFINITY,
             tab.label(),
             snap.model_tab == tab,
             HitTarget::SetModelTab(tab),
@@ -1698,7 +2380,7 @@ fn render_models_view(
     }
 
     // Scrollable model list + interactive scrollbar + scannable position indicator
-    let choices = filtered_stt_choices(snap.paths, snap.config, snap.model_tab, snap.model_filter);
+    let choices = snap.model_choices;
     let list_y = ty + 40.0;
     let list_bottom = area.y + area.h - 16.0;
     let list_h = (list_bottom - list_y).max(46.0);
@@ -1744,19 +2426,25 @@ fn render_models_view(
         let rrect = Rect::new(col_x, ry, row_w, row_h - 4.0);
         let is_sel = idx == snap.model_selected;
         let is_hov = rrect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
+        let hover_level = snap.hover_level(&HitTarget::PickModel(idx), is_hov);
 
         let is_active = if choice.is_local {
             snap.config.backend == "local" && snap.config.local_model == choice.model_id
+                && snap.inventory.is_ready(&choice.model_id)
         } else {
             snap.config.backend == choice.backend
                 && snap.config.commercial_model == choice.model_id
         };
 
-        if is_sel || is_hov {
+        if is_sel || hover_level > 0.0 {
             dl.fill_rect(
                 rrect,
                 8.0,
-                if is_sel { pal.bg_element } else { pal.bg_panel },
+                if is_sel {
+                    pal.bg_element
+                } else {
+                    pal.bg_hover.with_alpha((255.0 * hover_level) as u8)
+                },
             );
         }
 
@@ -1764,8 +2452,29 @@ fn render_models_view(
             dl.fill_circle(rrect.x + 12.0, rrect.y + 20.0, 4.0, pal.accent);
         }
 
+        let job = snap.download.filter(|job| {
+            choice.is_local
+                && job.target.model_id() == Some(choice.model_id.as_str())
+                && !matches!(
+                    job.state,
+                    DownloadState::Completed | DownloadState::Canceled
+                )
+        });
+        let transfer_width = (row_w * 0.53).min(335.0);
         let has_cfg_btn = !choice.is_local;
-        let text_right_pad = if has_cfg_btn { 165.0 } else { 135.0 };
+        let text_right_pad = if job.is_some() {
+            transfer_width + 34.0
+        } else if has_cfg_btn {
+            165.0
+        } else {
+            135.0
+        };
+        let label = if choice.is_local {
+            find_local_whisper_spec(&choice.model_id)
+                .map_or(choice.label.as_str(), |spec| spec.name())
+        } else {
+            &choice.label
+        };
 
         dl.draw_text(
             te,
@@ -1780,7 +2489,7 @@ fn render_models_view(
             },
             Some((row_w - text_right_pad).max(120.0)),
             1,
-            &choice.label,
+            label,
         );
         dl.draw_text(
             te,
@@ -1794,10 +2503,33 @@ fn render_models_view(
             &choice.detail,
         );
 
+        hits.push(HitZone {
+            rect: rrect,
+            target: HitTarget::PickModel(idx),
+        });
+        if let Some(job) = job {
+            draw_download_status(
+                dl,
+                te,
+                hits,
+                tooltip,
+                pal,
+                snap,
+                Rect::new(
+                    rrect.x + rrect.w - transfer_width - 12.0,
+                    ry,
+                    transfer_width,
+                    45.0,
+                ),
+                job,
+            );
+            continue;
+        }
+
         let (badge, bcol) = if is_active {
             ("Active", pal.accent)
         } else if choice.is_local {
-            if check_local_whisper_model(snap.paths, &choice.model_id).is_some() {
+            if snap.inventory.contains(&choice.model_id) {
                 ("Installed", pal.success)
             } else {
                 ("Download", pal.fg_muted)
@@ -1829,11 +2561,6 @@ fn render_models_view(
             badge,
         );
 
-        hits.push(HitZone {
-            rect: rrect,
-            target: HitTarget::PickModel(idx),
-        });
-
         // Centered Configure (Sliders) icon button for Cloud & Self-Hosted rows
         if has_cfg_btn {
             let cfg_rect = Rect::new(
@@ -1844,7 +2571,7 @@ fn render_models_view(
             );
             let cfg_hov = cfg_rect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
             if cfg_hov {
-                dl.fill_rect_bordered(cfg_rect, 6.0, pal.bg_hover, 1.0, pal.ring);
+                dl.fill_rect(cfg_rect, 6.0, pal.bg_hover);
                 *tooltip = Some((
                     cfg_rect,
                     if choice.backend == "custom" {
@@ -1854,13 +2581,13 @@ fn render_models_view(
                     },
                 ));
             }
-            draw_centered_icon(
-                dl,
+            dl.draw_animated_icon(
                 te,
                 IconId::Sliders,
                 cfg_rect,
                 14.0,
                 if cfg_hov { pal.fg } else { pal.fg_dim },
+                snap.icon_time(cfg_hov),
             );
             hits.push(HitZone {
                 rect: cfg_rect,
@@ -1899,20 +2626,35 @@ fn render_settings_view(
 ) {
     let col_w = (area.w - 56.0).clamp(400.0, 700.0);
     let col_x = area.x + (area.w - col_w) * 0.5;
-    let mut y = area.y + 12.0;
-
     dl.draw_text(
         te,
         col_x,
-        y,
-        18.0,
+        area.y + 19.0,
+        25.0,
         pal.fg,
         FontWeight::Bold,
         None,
         1,
         "Settings",
     );
-    y += 38.0;
+    let viewport = Rect::new(area.x, area.y + 60.0, area.w, area.h - 60.0);
+    let first_instance = dl.instances.len();
+    let first_hit = hits.len();
+    let previous_tooltip = *tooltip;
+    let offset = snap.settings_scroll as f32;
+    let mut y = viewport.y + 6.0 - offset;
+
+    dl.draw_text_vcentered(
+        te,
+        col_x,
+        y + 11.0,
+        13.0,
+        pal.fg_muted,
+        FontWeight::Semibold,
+        None,
+        "Speech engines",
+    );
+    y += 27.0;
 
     let mut draw_row = |dl: &mut DrawList,
                         te: &mut TextEngine,
@@ -1921,7 +2663,15 @@ fn render_settings_view(
                         desc: &str,
                         val: &str,
                         highlight: bool,
-                        target: HitTarget| {
+                        target: Option<HitTarget>| {
+        let bweight = if highlight {
+            FontWeight::Bold
+        } else {
+            FontWeight::Semibold
+        };
+        let btn_w = (te.measure(val, 12.5, bweight) + 28.0).clamp(94.0, col_w * 0.46);
+        let bx = col_x + col_w - btn_w;
+        let label_w = Some(bx - col_x - 12.0);
         dl.draw_text(
             te,
             col_x,
@@ -1929,7 +2679,7 @@ fn render_settings_view(
             14.0,
             pal.fg,
             FontWeight::Semibold,
-            None,
+            label_w,
             1,
             label,
         );
@@ -1940,62 +2690,87 @@ fn render_settings_view(
             12.0,
             pal.fg_dim,
             FontWeight::Regular,
-            None,
+            label_w,
             1,
             desc,
         );
 
-        let bweight = if highlight {
-            FontWeight::Bold
-        } else {
-            FontWeight::Semibold
-        };
-        let btn_w = (te.measure(val, 12.5, bweight) + 28.0).max(94.0);
-        let bx = col_x + col_w - btn_w;
-        let is_pressed = snap.pressed_target == Some(&target);
+        let is_pressed = target
+            .as_ref()
+            .is_some_and(|target| snap.pressed_target == Some(target));
         let dy = if is_pressed { 1.0 } else { 0.0 };
         let brect = Rect::new(bx, y + 4.0 + dy, btn_w, 30.0);
-        let hov = brect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
+        let hov = target.is_some() && brect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
         let ht = if hov { snap.hover_t } else { 0.0 };
-        let base_fill = if highlight {
-            pal.segment_active
-        } else {
-            pal.bg_panel
-        };
+        let base_fill = pal.bg_hover.with_alpha(0);
         let hover_fill = if is_pressed {
             pal.bg_active
         } else {
             pal.bg_hover
         };
         let fill = base_fill.lerp(hover_fill, ht);
-        let fg = pal.fg;
-        dl.fill_rect_bordered(
-            brect,
-            6.0,
-            fill,
-            1.0,
-            if highlight { pal.ring_focus } else { pal.ring },
-        );
+        let fg = if target.is_some() {
+            pal.fg
+        } else {
+            pal.fg_muted
+        };
+        dl.fill_rect(brect, 6.0, fill);
         dl.draw_text_centered(te, brect, 12.5, fg, bweight, val);
-        hits.push(HitZone {
-            rect: Rect::new(bx, y + 4.0, btn_w, 30.0),
-            target,
-        });
+        if let Some(target) = target {
+            hits.push(HitZone {
+                rect: Rect::new(bx, y + 4.0, btn_w, 30.0),
+                target,
+            });
+        }
 
         y += 48.0;
         dl.fill_rect(Rect::new(col_x, y - 4.0, col_w, 1.0), 0.0, pal.seam);
         y += 6.0;
     };
 
+    for (engine, models) in [
+        (LocalEngineKind::WhisperCpp, "Runs Whisper speech models"),
+        (
+            LocalEngineKind::AudioCpp,
+            "Runs Parakeet, Qwen ASR, and other local speech models",
+        ),
+    ] {
+        let download = snap.download.filter(|job| {
+            job.target == InstallTarget::Engine(engine)
+                && !matches!(
+                    job.state,
+                    DownloadState::Completed | DownloadState::Canceled
+                )
+        });
+        let (label, action) = if download.is_some() {
+            ("View download", Some(HitTarget::ToggleDownloads))
+        } else if snap.inventory.has_engine(engine) {
+            ("Installed", None)
+        } else {
+            ("Install engine", Some(HitTarget::InstallEngine(engine)))
+        };
+        let description = download.map_or(models, |job| job.label());
+        draw_row(
+            dl,
+            te,
+            hits,
+            engine.label(),
+            description,
+            label,
+            false,
+            action,
+        );
+    }
+
     draw_row(
         dl,
         te,
         hits,
-        "Global Hotkey Behavior (Ctrl+Shift+Space)",
-        "Choose Release-to-Dictate, Smart Hold/Tap, or Real-Time Live Streaming",
+        "Global shortcut",
+        "How Ctrl + Shift + Space starts and stops recording",
         snap.config.hotkey_mode.label().trim_start_matches("Hotkey: "),
         false,
-        HitTarget::CycleHotkeyMode,
+        Some(HitTarget::CycleHotkeyMode),
     );
 
     draw_row(
@@ -2003,10 +2778,10 @@ fn render_settings_view(
         te,
         hits,
         "Text Delivery",
-        "How transcribed speech is inserted into the active application",
-        snap.config.delivery_mode.label(),
+        "How the global shortcut delivers text",
+        snap.config.delivery_mode.short_label(),
         false,
-        HitTarget::CycleDelivery,
+        Some(HitTarget::CycleDelivery),
     );
 
     draw_row(
@@ -2014,10 +2789,10 @@ fn render_settings_view(
         te,
         hits,
         "Spoken Language",
-        "Auto-detect or pin a specific ISO-639-1 language code",
-        &snap.config.language,
+        "Choose the language you usually dictate in",
+        DictateConfig::language_label(&snap.config.language),
         snap.config.language != "auto",
-        HitTarget::CycleLanguage,
+        Some(HitTarget::CycleLanguage),
     );
 
     draw_row(
@@ -2028,7 +2803,7 @@ fn render_settings_view(
         "Stop recording automatically after 600 ms of silence",
         if snap.config.vad_auto_stop { "On" } else { "Off" },
         snap.config.vad_auto_stop,
-        HitTarget::ToggleVad,
+        Some(HitTarget::ToggleVad),
     );
 
     // Self-Hosted OpenAI-Compatible Server row
@@ -2049,11 +2824,11 @@ fn render_settings_view(
         dl,
         te,
         hits,
-        "Self-Hosted Server (vLLM / Speaches / Sherpa-ONNX)",
+        "Self-hosted server",
         &format!("{short_url}  ·  {custom_model}"),
         "Configure",
         snap.config.backend == "custom",
-        HitTarget::OpenProviderConfig("custom".to_string()),
+        Some(HitTarget::OpenProviderConfig("custom".to_string())),
     );
 
     // Commercial & Cloud STT Providers quick-configure strip (shows green dot when ready)
@@ -2078,7 +2853,7 @@ fn render_settings_view(
             FontWeight::Regular,
             None,
             1,
-            "Click any provider to configure its API key, base URL override, or default model",
+            "Manage provider credentials and endpoints",
         );
         y += 42.0;
 
@@ -2119,13 +2894,12 @@ fn render_settings_view(
             let fill = if is_cur {
                 pal.segment_active.lerp(pal.bg_active, ht)
             } else {
-                pal.bg_panel.lerp(
+                pal.bg_hover.with_alpha(0).lerp(
                     if is_pressed { pal.bg_active } else { pal.bg_hover },
                     ht,
                 )
             };
-            let border = if is_cur { pal.ring_focus } else { pal.ring };
-            dl.fill_rect_bordered(prect, 6.0, fill, 1.0, border);
+            dl.fill_rect(prect, 6.0, fill);
             let dot_col = if is_cur {
                 pal.accent
             } else if ready {
@@ -2182,7 +2956,7 @@ fn render_settings_view(
             FontWeight::Regular,
             None,
             1,
-            "Click device name to cycle detected microphones, or refresh",
+            "Choose an input device",
         );
 
         let ref_pressed = snap.pressed_target == Some(&HitTarget::RefreshMicrophones);
@@ -2197,23 +2971,21 @@ fn render_settings_view(
         if ref_hov {
             *tooltip = Some((ref_rect, "Refresh microphones"));
         }
-        dl.fill_rect_bordered(
+        dl.fill_rect(
             ref_rect,
             8.0,
-            pal.bg_panel.lerp(
+            pal.bg_hover.with_alpha(0).lerp(
                 if ref_pressed { pal.bg_active } else { pal.bg_hover },
                 ref_ht,
             ),
-            1.0,
-            pal.ring,
         );
-        draw_centered_icon(
-            dl,
+        dl.draw_animated_icon(
             te,
             IconId::Refresh,
             ref_rect,
             14.0,
             if ref_hov { pal.fg } else { pal.fg_muted },
+            snap.icon_time(ref_hov),
         );
         hits.push(HitZone {
             rect: Rect::new(col_x + col_w - 30.0, y + 4.0, 30.0, 30.0),
@@ -2232,15 +3004,13 @@ fn render_settings_view(
         );
         let hov = brect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
         let ht = if hov { snap.hover_t } else { 0.0 };
-        dl.fill_rect_bordered(
+        dl.fill_rect(
             brect,
             8.0,
-            pal.bg_panel.lerp(
+            pal.bg_hover.with_alpha(0).lerp(
                 if mic_pressed { pal.bg_active } else { pal.bg_hover },
                 ht,
             ),
-            1.0,
-            pal.ring,
         );
         dl.draw_text_centered(te, brect, 12.5, pal.fg, FontWeight::Semibold, mic_label);
         hits.push(HitZone {
@@ -2275,7 +3045,7 @@ fn render_settings_view(
             FontWeight::Regular,
             None,
             1,
-            "Closing the window hides Enio to the Activity Bar (System Tray)",
+            "The window closes to the system tray",
         );
         let is_dark = current_theme() == Theme::Dark;
         let lbl = if is_dark { "Dark" } else { "Light" };
@@ -2292,15 +3062,13 @@ fn render_settings_view(
         );
         let hov = brect.contains(snap.mouse_pos.0, snap.mouse_pos.1);
         let ht = if hov { snap.hover_t } else { 0.0 };
-        dl.fill_rect_bordered(
+        dl.fill_rect(
             brect,
             8.0,
-            pal.bg_panel.lerp(
+            pal.bg_hover.with_alpha(0).lerp(
                 if th_pressed { pal.bg_active } else { pal.bg_hover },
                 ht,
             ),
-            1.0,
-            pal.ring,
         );
         let gx = brect.x + (brect.w - group_w) * 0.5;
         let cy = brect.y + brect.h * 0.5;
@@ -2327,6 +3095,35 @@ fn render_settings_view(
             target: HitTarget::ToggleTheme,
         });
     }
+
+    dl.clip_instances_from(first_instance, viewport);
+    let bottom = viewport.y + viewport.h;
+    for hit in &mut hits[first_hit..] {
+        let top = hit.rect.y.max(viewport.y);
+        let end = (hit.rect.y + hit.rect.h).min(bottom);
+        hit.rect.y = top;
+        hit.rect.h = (end - top).max(0.0);
+    }
+    hits.retain(|hit| hit.rect.h > 0.0);
+    if !viewport.contains(snap.mouse_pos.0, snap.mouse_pos.1) {
+        *tooltip = previous_tooltip;
+    }
+    let total = (y + 46.0 + offset - viewport.y).ceil() as usize;
+    let visible = viewport.h.floor() as usize;
+    draw_scrollbar(
+        dl,
+        hits,
+        pal,
+        ScrollList::Settings,
+        area.x + area.w - 12.0,
+        viewport.y,
+        viewport.h,
+        snap.settings_scroll,
+        visible,
+        total,
+        snap.mouse_pos,
+        snap.dragging_scrollbar,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2463,7 +3260,7 @@ fn render_provider_config_modal(
     let my = (snap.height - mh) * 0.5;
     let mrect = Rect::new(mx, my, mw, mh);
 
-    dl.fill_rect_bordered(mrect, 12.0, pal.bg_popover, 1.0, pal.ring);
+    dl.fill_rect(mrect, 12.0, pal.bg_popover);
     // Catch clicks inside modal so they don't close it
     hits.push(HitZone {
         rect: mrect,
@@ -2659,87 +3456,159 @@ fn render_confirm_download_modal(
     hits: &mut Vec<HitZone>,
     pal: &Palette,
     snap: &UiSnapshot<'_>,
-    label: &str,
-    size_mb: u32,
-    engine_name: &str,
+    target: &InstallTarget,
 ) {
     hits.clear();
-    dl.fill_rect(Rect::new(0.0, 0.0, snap.width, snap.height), 0.0, pal.backdrop);
+    let backdrop = Rect::new(0.0, 0.0, snap.width, snap.height);
+    dl.fill_rect(backdrop, 0.0, pal.backdrop);
     hits.push(HitZone {
-        rect: Rect::new(0.0, 0.0, snap.width, snap.height),
+        rect: backdrop,
         target: HitTarget::CloseModal,
     });
 
-    let mw = 480.0_f32.min(snap.width - 48.0);
-    let mh = 176.0;
-    let mx = (snap.width - mw) * 0.5;
-    let my = (snap.height - mh) * 0.5;
-    let mrect = Rect::new(mx, my, mw, mh);
+    let model = target.model_id().and_then(find_local_whisper_spec);
+    let model_ready = target
+        .model_id()
+        .is_some_and(|id| snap.inventory.contains(id));
+    let (title, button, description, h) = match target {
+        InstallTarget::Engine(_) => (
+            "Install speech engine",
+            "Install engine",
+            "Downloads the executable and required libraries. You can choose a compatible speech model afterward.",
+            184.0,
+        ),
+        InstallTarget::Model(_) => (
+            if model_ready { "Set up model" } else { "Download model" },
+            if model_ready { "Set up" } else { "Download" },
+            "Once setup is complete, this model transcribes on your device.",
+            249.0,
+        ),
+    };
+    let w = 474.0_f32.min(snap.width - 48.0);
+    let panel = Rect::new((snap.width - w) * 0.5, (snap.height - h) * 0.5, w, h);
+    draw_floating_surface(dl, pal, panel, 12.0);
+    hits.push(HitZone {
+        rect: panel,
+        target: HitTarget::KeepModalOpen,
+    });
 
-    dl.fill_rect_bordered(mrect, 12.0, pal.bg_popover, 1.0, pal.ring);
-    dl.fill_circle(mx + 22.0, my + 26.0, 4.5, pal.accent);
+    let x = panel.x + 22.0;
+    let icon = Rect::new(x, panel.y + 20.0, 39.0, 39.0);
+    dl.fill_rect(icon, 8.0, pal.bg_element);
+    draw_centered_icon(dl, te, IconId::Download, icon, 18.0, pal.fg);
     dl.draw_text_vcentered(
         te,
-        mx + 34.0,
-        my + 26.0,
-        15.5,
+        x + 51.0,
+        panel.y + 28.0,
+        18.0,
         pal.fg,
         FontWeight::Bold,
-        Some(mw - 56.0),
-        "Download Speech Model?",
+        None,
+        title,
     );
-    dl.draw_text(
+    dl.draw_text_vcentered(
         te,
-        mx + 22.0,
-        my + 50.0,
-        13.5,
-        pal.fg_prose,
-        FontWeight::Semibold,
-        Some(mw - 44.0),
-        1,
-        label,
-    );
-    dl.draw_text(
-        te,
-        mx + 22.0,
-        my + 74.0,
-        12.5,
-        pal.fg_dim,
+        x + 51.0,
+        panel.y + 50.0,
+        13.0,
+        pal.fg_muted,
         FontWeight::Regular,
-        Some(mw - 44.0),
-        2,
-        &format!(
-            "Downloads ~{size_mb} MB model weights (plus {engine_name} runtime if not yet installed) to your local Enio folder."
-        ),
+        Some(w - 95.0),
+        target.name(),
     );
 
-    let btn_y = my + mh - 48.0;
-    let dl_w = draw_modal_button(
+    if let Some(model) = model {
+        let details = Rect::new(x, panel.y + 78.0, w - 44.0, 72.0);
+        dl.fill_rect(
+            Rect::new(x + 12.0, details.y + 36.0, details.w - 24.0, 1.0),
+            0.0,
+            pal.seam,
+        );
+        let model_size = if model_ready {
+            "Already downloaded".into()
+        } else if model.size_mb >= 1000 {
+            format!("About {:.1} GB", f64::from(model.size_mb) / 1000.0)
+        } else {
+            format!("About {} MB", model.size_mb)
+        };
+        let engine_status = if snap.inventory.has_engine(model.engine) {
+            "installed"
+        } else {
+            "added with setup"
+        };
+        let engine_detail = format!("{} · {engine_status}", model.engine.label());
+        for (index, (item, detail)) in [
+            ("Model files", model_size.as_str()),
+            ("Speech engine", engine_detail.as_str()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let cy = details.y + 18.0 + index as f32 * 36.0;
+            dl.draw_text_vcentered(
+                te,
+                x + 12.0,
+                cy,
+                12.5,
+                pal.fg,
+                FontWeight::Semibold,
+                None,
+                item,
+            );
+            let detail_w = te.measure(detail, 12.5, FontWeight::Regular);
+            dl.draw_text_vcentered(
+                te,
+                x + details.w - 12.0 - detail_w,
+                cy,
+                12.5,
+                pal.fg_muted,
+                FontWeight::Regular,
+                None,
+                detail,
+            );
+        }
+    }
+    dl.draw_text(
+        te,
+        x,
+        panel.y + if model.is_some() { 164.0 } else { 80.0 },
+        12.5,
+        pal.fg_muted,
+        FontWeight::Regular,
+        Some(w - 44.0),
+        2,
+        description,
+    );
+
+    let action_w = (te.measure(button, 12.5, FontWeight::Bold) + 28.0).max(84.0);
+    let y = panel.y + h - 51.0;
+    let action_x = panel.x + w - 22.0 - action_w;
+    draw_modal_button(
         dl,
         te,
         hits,
         pal,
-        mx + 22.0,
-        btn_y,
-        32.0,
-        &format!("Download (~{size_mb} MB)"),
-        ModalBtnTone::Primary,
-        HitTarget::ConfirmDownloadModel,
+        action_x - 92.0,
+        y,
+        33.0,
+        "Cancel",
+        ModalBtnTone::Secondary,
+        HitTarget::CloseModal,
         snap.mouse_pos,
         snap.hover_t,
         snap.pressed_target,
     );
-    let _ = draw_modal_button(
+    draw_modal_button(
         dl,
         te,
         hits,
         pal,
-        mx + 22.0 + dl_w + 10.0,
-        btn_y,
-        32.0,
-        "Cancel (Esc)",
-        ModalBtnTone::Secondary,
-        HitTarget::CloseModal,
+        action_x,
+        y,
+        33.0,
+        button,
+        ModalBtnTone::Primary,
+        HitTarget::ConfirmInstall,
         snap.mouse_pos,
         snap.hover_t,
         snap.pressed_target,
@@ -2767,7 +3636,7 @@ fn render_confirm_delete_modal(
     let my = (snap.height - mh) * 0.5;
     let mrect = Rect::new(mx, my, mw, mh);
 
-    dl.fill_rect_bordered(mrect, 12.0, pal.bg_popover, 1.0, pal.ring);
+    dl.fill_rect(mrect, 12.0, pal.bg_popover);
     dl.fill_circle(mx + 22.0, my + 26.0, 4.5, pal.error);
     dl.draw_text_vcentered(
         te,
@@ -2824,6 +3693,124 @@ fn render_confirm_delete_modal(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn render_transcript_modal(
+    dl: &mut DrawList,
+    te: &mut TextEngine,
+    hits: &mut Vec<HitZone>,
+    pal: &Palette,
+    snap: &UiSnapshot<'_>,
+    entry: &HistoryEntry,
+    scroll: usize,
+    copied: bool,
+) {
+    hits.clear();
+    let backdrop = Rect::new(0.0, 0.0, snap.width, snap.height);
+    dl.fill_rect(backdrop, 0.0, pal.backdrop);
+    hits.push(HitZone {
+        rect: backdrop,
+        target: HitTarget::CloseModal,
+    });
+    let w = 640.0_f32.min(snap.width - 48.0);
+    let h = (snap.height - 64.0).min(540.0);
+    let panel = Rect::new((snap.width - w) * 0.5, (snap.height - h) * 0.5, w, h);
+    dl.fill_rect(panel, 12.0, pal.bg_popover);
+    hits.push(HitZone {
+        rect: panel,
+        target: HitTarget::KeepModalOpen,
+    });
+
+    let x = panel.x + 22.0;
+    dl.draw_text_vcentered(
+        te,
+        x,
+        panel.y + 30.0,
+        18.0,
+        pal.fg,
+        FontWeight::Bold,
+        None,
+        "Transcript",
+    );
+    let date = entry
+        .created_at
+        .with_timezone(&chrono::Local)
+        .format("%b %e, %Y · %H:%M");
+    let meta = format!("{date}  ·  {:.1}s  ·  {}", entry.duration_secs, entry.model);
+    dl.draw_text_vcentered(
+        te,
+        x,
+        panel.y + 54.0,
+        12.0,
+        pal.fg_muted,
+        FontWeight::Regular,
+        Some(w - 44.0),
+        &meta,
+    );
+
+    let body = Rect::new(x, panel.y + 75.0, w - 44.0, h - 139.0);
+    dl.fill_rect(body, 8.0, pal.bg_panel);
+    let text_w = body.w - 38.0;
+    let font_size = 15.0;
+    let visible = ((body.h - 24.0) / (font_size * 1.45)).floor() as usize;
+    let total = te.measure_wrapped_lines(&entry.text, font_size, text_w, usize::MAX);
+    let start = scroll.min(total.saturating_sub(visible));
+    dl.draw_text_lines(
+        te,
+        body.x + 13.0,
+        body.y + 11.0,
+        font_size,
+        pal.fg_prose,
+        FontWeight::Regular,
+        Some(text_w),
+        start,
+        visible,
+        &entry.text,
+    );
+    if total > visible {
+        draw_scrollbar(
+            dl,
+            hits,
+            pal,
+            ScrollList::Transcript,
+            body.x + body.w - 12.0,
+            body.y + 10.0,
+            body.h - 20.0,
+            start,
+            visible,
+            total,
+            snap.mouse_pos,
+            snap.dragging_scrollbar,
+        );
+    }
+
+    let y = panel.y + panel.h - 47.0;
+    let mut x = x;
+    for (label, tone, target) in [
+        (
+            if copied { "Copied" } else { "Copy transcript" },
+            ModalBtnTone::Primary,
+            HitTarget::CopyHistory(entry.id.clone()),
+        ),
+        ("Close", ModalBtnTone::Secondary, HitTarget::CloseModal),
+    ] {
+        x += draw_modal_button(
+            dl,
+            te,
+            hits,
+            pal,
+            x,
+            y,
+            32.0,
+            label,
+            tone,
+            target,
+            snap.mouse_pos,
+            snap.hover_t,
+            snap.pressed_target,
+        ) + 8.0;
+    }
+}
+
 /// Render the borderless, always-on-top Floating Speech Overlay Pill (`420x74`)
 /// on top of any active input in the system.
 #[allow(clippy::too_many_arguments)]
@@ -2833,10 +3820,12 @@ pub fn render_overlay_pill(
     width: f32,
     height: f32,
     config: &DictateConfig,
+    from_hotkey: bool,
     phase: &DictationPhase,
     elapsed_secs: u64,
     audio_levels: [f32; 15],
     live_preview: &str,
+    status: Option<&str>,
 ) {
     let pal = palette();
     let is_rec = matches!(phase, DictationPhase::Recording);
@@ -2844,6 +3833,7 @@ pub fn render_overlay_pill(
     let ring = match phase {
         DictationPhase::Recording => pal.accent,
         DictationPhase::Transcribing => pal.warning,
+        DictationPhase::SetupRequired => pal.warning,
         DictationPhase::Error(_) => pal.error,
         _ => pal.ring,
     };
@@ -2880,13 +3870,13 @@ pub fn render_overlay_pill(
         DictationPhase::Recording => {
             let m = elapsed_secs / 60;
             let s = elapsed_secs % 60;
-            let hint = if config.delivery_mode == crate::config::DeliveryMode::ClipboardOnly {
-                "Clipboard Only · switch to Auto-Paste to insert"
+            let hint = if !from_hotkey {
+                "Click here to stop"
             } else {
                 match config.hotkey_mode {
-                    HotkeyMode::HoldToTalk => "Release Ctrl+Shift+Space to insert",
-                    HotkeyMode::SmartHoldOrTap => "Release keys (or tap again) to insert",
-                    HotkeyMode::RealTimeStreaming => "Live streaming · pauses auto-insert",
+                    HotkeyMode::HoldToTalk => "Release the shortcut to stop",
+                    HotkeyMode::SmartHoldOrTap => "Hold to talk, or tap again to stop",
+                    HotkeyMode::RealTimeStreaming => "Live mode · press shortcut to stop",
                 }
             };
             let sub = if live_preview.trim().is_empty() {
@@ -2897,11 +3887,19 @@ pub fn render_overlay_pill(
             (format!("Listening · {m}:{s:02}"), sub)
         }
         DictationPhase::Transcribing => ("Transcribing…".to_string(), config.active_summary()),
-        DictationPhase::Installing { label, progress } => {
-            (format!("Installing ({progress}%)"), label.clone())
-        }
+        DictationPhase::SetupRequired => (
+            "Setup required".into(),
+            format!("Open {} to finish model setup.", crate::APP_NAME),
+        ),
         DictationPhase::Error(err) => ("Error".to_string(), err.clone()),
-        DictationPhase::Idle => ("Ready".to_string(), config.active_summary()),
+        DictationPhase::Idle => {
+            let title = if live_preview.is_empty() {
+                "No speech captured"
+            } else {
+                "Transcript ready"
+            };
+            (title.into(), status.unwrap_or_default().to_string())
+        }
     };
 
     dl.draw_text(
@@ -2911,7 +3909,7 @@ pub fn render_overlay_pill(
         14.0,
         pal.fg,
         FontWeight::Bold,
-        Some(pill.w - 188.0),
+        Some(pill.w - if is_rec || is_trans { 188.0 } else { 76.0 }),
         1,
         &title,
     );
@@ -2922,28 +3920,29 @@ pub fn render_overlay_pill(
         11.5,
         pal.fg_muted,
         FontWeight::Regular,
-        Some(pill.w - 188.0),
+        Some(pill.w - if is_rec || is_trans { 188.0 } else { 76.0 }),
         1,
         &sub,
     );
 
+    if !is_rec && !is_trans {
+        return;
+    }
     // 15-bar live speech-reactive equalizer (or smooth travelling wave while transcribing)
     let eq_right = pill.x + pill.w - 24.0;
     let eq_start = eq_right - (15.0 * 6.5);
     let eq_cy = pill.y + pill.h * 0.5;
     let now_sec = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs_f32())
+        .map(|d| (d.as_secs_f64() % 60.0) as f32)
         .unwrap_or(0.0);
     for (i, &lvl) in audio_levels.iter().enumerate() {
         let (bar_lvl, col) = if is_rec {
             let v = lvl.clamp(0.0, 1.0);
             (v, pal.accent_soft.lerp(pal.accent, (0.35 + v * 0.85).min(1.0)))
-        } else if is_trans {
+        } else {
             let wave = 0.25 + 0.55 * ((now_sec * 6.0 - i as f32 * 0.45).sin() * 0.5 + 0.5);
             (wave, pal.warning)
-        } else {
-            (0.12, pal.bg_active)
         };
         let bh = (5.0 + bar_lvl * 30.0).min(36.0);
         let bx = eq_start + i as f32 * 6.5;

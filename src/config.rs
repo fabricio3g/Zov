@@ -93,6 +93,14 @@ pub enum DeliveryMode {
 }
 
 impl DeliveryMode {
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::TypeAndClipboard => "Auto-type",
+            Self::PasteAndClipboard => "Auto-paste",
+            Self::ClipboardOnly => "Clipboard",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::TypeAndClipboard => "Auto-Type + Clipboard",
@@ -214,6 +222,22 @@ impl Default for DictateConfig {
 pub const LANGUAGES: &[&str] = &["auto", "en", "es", "pt", "fr", "de", "it", "ja", "ko", "zh"];
 
 impl DictateConfig {
+    pub fn language_label(language: &str) -> &str {
+        match language {
+            "auto" => "Auto language",
+            "en" => "English",
+            "es" => "Spanish",
+            "pt" => "Portuguese",
+            "fr" => "French",
+            "de" => "German",
+            "it" => "Italian",
+            "ja" => "Japanese",
+            "ko" => "Korean",
+            "zh" => "Chinese",
+            other => other,
+        }
+    }
+
     pub fn load(paths: &AppPaths) -> Self {
         if let Ok(raw) = fs::read_to_string(&paths.config_path) {
             if let Ok(cfg) = serde_json::from_str::<Self>(&raw) {

@@ -27,6 +27,15 @@ pub enum LocalEngineKind {
     AudioCpp,
 }
 
+impl LocalEngineKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::WhisperCpp => "whisper.cpp",
+            Self::AudioCpp => "audio.cpp",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct LocalWhisperSpec {
     pub id: &'static str,
@@ -42,6 +51,13 @@ pub struct LocalWhisperSpec {
     pub recommended: bool,
     /// True if downloading from Hugging Face may benefit from or require `hf_token`.
     pub hf_gated_or_hub: bool,
+}
+
+impl LocalWhisperSpec {
+    pub fn name(&self) -> &'static str {
+        let label = self.label.trim_start_matches("[Non-Whisper] ");
+        label.split('—').next().unwrap_or(label).trim()
+    }
 }
 
 pub const LOCAL_WHISPER_CATALOG: &[LocalWhisperSpec] = &[

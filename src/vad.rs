@@ -5,7 +5,8 @@
 //! - `apps/desktop/renderer/src/lib/features/chat/composer/voice-activity.ts`
 //! - `apps/desktop/renderer/src/lib/features/chat/composer/use-dictation.svelte.ts`
 
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{num_complex::Complex, Fft, FftPlanner};
+use std::sync::{Arc, OnceLock};
 
 /// Relative bar heights for the 15-bar live equalizer, normalized to the tallest (58).
 pub const WAVE_WEIGHTS: [f32; 15] = [
@@ -100,70 +101,92 @@ impl VoiceActivity {
     }
 }
 
-/// Reject broad hiss, low hum, and single pure tones before amplitude endpointing.
-/// Computes an FFT on a window of time-domain samples and checks:
-/// 1. At least 60% of total power sits in the 85–6000 Hz speech band.
-/// 2. Spectral flatness < 0.55 (rejects white noise / broad hiss).
-/// 3. Peak 3-bin tone < 80% of speech band power (rejects pure sine tones / hum).
-pub fn voice_like_spectrum(samples: &[f32], sample_rate: u32) -> bool {
-    let n = 256usize;
-    if samples.len() < n || sample_rate == 0 {
-        return true;
-    }
-    let slice = &samples[samples.len() - n..];
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(n);
-    let mut buffer: Vec<Complex<f32>> = slice
-        .iter()
-        .enumerate()
-        .map(|(i, &s)| {
-            // Hann window
-            let w = 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / n as f32).cos();
-            Complex::new(s * w, 0.0)
-        })
-        .collect();
-    fft.process(&mut buffer);
+const SPECTRUM_SIZE: usize = 256;
 
-    let half = n / 2;
-    let bin_hz = sample_rate as f32 / n as f32;
-    let mut total = 0.0_f64;
-    let mut band = 0.0_f64;
-    let mut log_band = 0.0_f64;
-    let mut bins = 0usize;
-    let mut peak = 0.0_f64;
-    let mut peak_index = 0usize;
-    let mut powers = vec![0.0_f64; half];
+struct SpectrumPlan {
+    fft: Arc<dyn Fft<f32>>,
+    hann: [f32; SPECTRUM_SIZE],
+}
 
-    for index in 1..half {
-        let hz = index as f32 * bin_hz;
-        let power = f64::from(buffer[index].norm_sqr());
-        powers[index] = power;
-        total += power;
-        if !(85.0..=6000.0).contains(&hz) {
-            continue;
-        }
-        band += power;
-        log_band += power.max(1e-12).ln();
-        bins += 1;
-        if power > peak {
-            peak = power;
-            peak_index = index;
+/// Local spectral gate. The plan and window are shared, while each recording
+/// keeps its own working buffers.
+pub struct VoiceSpectrum {
+    plan: &'static SpectrumPlan,
+    buffer: [Complex<f32>; SPECTRUM_SIZE],
+    scratch: Vec<Complex<f32>>,
+}
+
+impl Default for VoiceSpectrum {
+    fn default() -> Self {
+        static PLAN: OnceLock<SpectrumPlan> = OnceLock::new();
+        let plan = PLAN.get_or_init(|| SpectrumPlan {
+            fft: FftPlanner::<f32>::new().plan_fft_forward(SPECTRUM_SIZE),
+            hann: std::array::from_fn(|i| {
+                0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / SPECTRUM_SIZE as f32).cos()
+            }),
+        });
+        Self {
+            plan,
+            buffer: [Complex::default(); SPECTRUM_SIZE],
+            scratch: vec![Complex::default(); plan.fft.get_inplace_scratch_len()],
         }
     }
+}
 
-    if band <= 0.0 || bins == 0 || total <= 0.0 || (band / total) < 0.6 {
-        return false;
+impl VoiceSpectrum {
+    /// Reject broad hiss, low hum, and tones before amplitude endpointing.
+    pub fn is_voice_like(&mut self, samples: &[f32], sample_rate: u32) -> bool {
+        let n = SPECTRUM_SIZE;
+        if samples.len() < n || sample_rate == 0 {
+            return true;
+        }
+        let slice = &samples[samples.len() - n..];
+        for ((bin, &sample), &window) in self.buffer.iter_mut().zip(slice).zip(&self.plan.hann) {
+            *bin = Complex::new(sample * window, 0.0);
+        }
+        self.plan
+            .fft
+            .process_with_scratch(&mut self.buffer, &mut self.scratch);
+
+        let half = n / 2;
+        let bin_hz = sample_rate as f32 / n as f32;
+        let mut total = 0.0_f64;
+        let mut band = 0.0_f64;
+        let mut log_band = 0.0_f64;
+        let mut bins = 0usize;
+        let mut peak = 0.0_f64;
+        let mut peak_index = 0usize;
+
+        for index in 1..half {
+            let hz = index as f32 * bin_hz;
+            let power = f64::from(self.buffer[index].norm_sqr());
+            total += power;
+            if !(85.0..=6000.0).contains(&hz) {
+                continue;
+            }
+            band += power;
+            log_band += power.max(1e-12).ln();
+            bins += 1;
+            if power > peak {
+                peak = power;
+                peak_index = index;
+            }
+        }
+
+        if band <= 0.0 || bins == 0 || total <= 0.0 || (band / total) < 0.6 {
+            return false;
+        }
+
+        let flatness = (log_band / bins as f64).exp() / (band / bins as f64);
+        let lo = peak_index.saturating_sub(1).max(1);
+        let hi = (peak_index + 1).min(half - 1);
+        let tone: f64 = self.buffer[lo..=hi]
+            .iter()
+            .map(|bin| f64::from(bin.norm_sqr()))
+            .sum();
+
+        flatness < 0.55 && (tone / band) < 0.8
     }
-
-    let flatness = (log_band / bins as f64).exp() / (band / bins as f64);
-    let mut tone = 0.0_f64;
-    let lo = peak_index.saturating_sub(1).max(1);
-    let hi = (peak_index + 1).min(half - 1);
-    for p in &powers[lo..=hi] {
-        tone += *p;
-    }
-
-    flatness < 0.55 && (tone / band) < 0.8
 }
 
 /// Discard explicit non-speech captions (`[blank_audio]`, `[silence]`, `(noise)`, `<|...|>`),
@@ -311,6 +334,6 @@ mod tests {
         let samples: Vec<f32> = (0..256)
             .map(|i| (std::f32::consts::TAU * 440.0 * i as f32 / 16_000.0).sin())
             .collect();
-        assert!(!voice_like_spectrum(&samples, 16_000));
+        assert!(!VoiceSpectrum::default().is_voice_like(&samples, 16_000));
     }
 }

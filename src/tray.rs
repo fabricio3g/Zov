@@ -1,12 +1,12 @@
 //! Native Windows System Tray (Activity Bar / Notification Area) icon & menu,
-//! plus Enio brand RGBA icon rasterization via `resvg`.
+//! plus Zov brand RGBA icon rasterization via `resvg`.
 //!
 //! Closing the main window minimizes to the system tray so `Ctrl+Shift+Space`
 //! system-wide dictation keeps running silently in the background.
 
 use std::sync::mpsc;
 
-const APP_ICON_SVG: &str = include_str!("../assets/icons/app-icon-dark.svg");
+const APP_ICON_SVG: &str = include_str!("../assets/icons/enio/unframed/icon-waveform-white.svg");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrayEvent {
@@ -15,7 +15,7 @@ pub enum TrayEvent {
     Quit,
 }
 
-/// Rasterize Enio's framed app icon SVG into an RGBA8 pixel buffer of `(size, size)`.
+/// Rasterize Zov's unframed waveform mark into an RGBA8 pixel buffer.
 pub fn rasterize_brand_rgba(size: u32) -> Option<Vec<u8>> {
     let opt = resvg::usvg::Options::default();
     let tree = resvg::usvg::Tree::from_str(APP_ICON_SVG, &opt).ok()?;
@@ -46,10 +46,31 @@ pub fn create_winit_window_icon() -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(rgba, 32, 32).ok()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn brand_icon_has_a_transparent_frame_and_keeps_the_waveform() {
+        let rgba = rasterize_brand_rgba(64).unwrap();
+        let alpha = |x: usize, y: usize| rgba[(y * 64 + x) * 4 + 3];
+        assert!((0..64).all(|coordinate| {
+            alpha(coordinate, 0) == 0
+                && alpha(0, coordinate) == 0
+                && alpha(coordinate, 63) == 0
+                && alpha(63, coordinate) == 0
+        }));
+        assert_eq!(alpha(9, 40), 255);
+        assert_eq!(alpha(17, 40), 255);
+        assert_eq!(alpha(25, 40), 255);
+        assert_eq!(alpha(52, 30), 255);
+    }
+}
+
 /// Spawn a native Windows System Tray (Activity Bar) icon with left-click restore
-/// and right-click context menu (`Open Agente Dictate`, `Start / Stop Dictation`, `Quit`).
-pub fn spawn_tray_icon() -> mpsc::Receiver<TrayEvent> {
-    let (tx, rx) = mpsc::channel();
+/// and right-click context menu (`Open Zov`, `Start / Stop Dictation`, `Quit`).
+pub fn spawn_tray_icon(wake: winit::event_loop::EventLoopProxy<()>) -> mpsc::Receiver<TrayEvent> {
+    let (tx, rx) = crate::event_channel(wake);
 
     #[cfg(windows)]
     std::thread::spawn(move || {
@@ -63,8 +84,8 @@ pub fn spawn_tray_icon() -> mpsc::Receiver<TrayEvent> {
 }
 
 #[cfg(windows)]
-fn windows_tray_loop(tx: mpsc::Sender<TrayEvent>) {
-    use std::sync::OnceLock;
+fn windows_tray_loop(tx: std::sync::Arc<crate::WakeSender<TrayEvent>>) {
+    use std::sync::{Arc, OnceLock};
     use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows_sys::Win32::Graphics::Gdi::{
         CreateBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, BITMAPINFO,
@@ -87,7 +108,7 @@ fn windows_tray_loop(tx: mpsc::Sender<TrayEvent>) {
     const CMD_DICTATE: u32 = 1002;
     const CMD_QUIT: u32 = 1003;
 
-    static TRAY_TX: OnceLock<mpsc::Sender<TrayEvent>> = OnceLock::new();
+    static TRAY_TX: OnceLock<Arc<crate::WakeSender<TrayEvent>>> = OnceLock::new();
     let _ = TRAY_TX.set(tx);
 
     fn wide(s: &str) -> Vec<u16> {
@@ -110,9 +131,10 @@ fn windows_tray_loop(tx: mpsc::Sender<TrayEvent>) {
             let dst = std::slice::from_raw_parts_mut(bits as *mut u8, (size * size * 4) as usize);
             for (s, d) in rgba.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
                 // BGRA premultiplied
-                d[0] = s[2];
-                d[1] = s[1];
-                d[2] = s[0];
+                let alpha = u16::from(s[3]);
+                d[0] = (u16::from(s[2]) * alpha / 255) as u8;
+                d[1] = (u16::from(s[1]) * alpha / 255) as u8;
+                d[2] = (u16::from(s[0]) * alpha / 255) as u8;
                 d[3] = s[3];
             }
         }
@@ -153,7 +175,7 @@ fn windows_tray_loop(tx: mpsc::Sender<TrayEvent>) {
             }
             if ev == WM_RBUTTONUP {
                 let menu = CreatePopupMenu();
-                let s_open = wide("Open Enio");
+                let s_open = wide(&format!("Open {}", crate::APP_NAME));
                 let s_dict = wide("Start / Stop Dictation (Ctrl+Shift+Space)");
                 let s_quit = wide("Quit");
                 AppendMenuW(menu, MF_STRING, CMD_OPEN as usize, s_open.as_ptr());
@@ -235,7 +257,7 @@ fn windows_tray_loop(tx: mpsc::Sender<TrayEvent>) {
         nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         nid.uCallbackMessage = WM_TRAYICON;
         nid.hIcon = hicon;
-        let tip = wide("Enio — Ctrl+Shift+Space");
+        let tip = wide(&format!("{} — Ctrl+Shift+Space", crate::APP_NAME));
         let n = tip.len().min(nid.szTip.len());
         nid.szTip[..n].copy_from_slice(&tip[..n]);
 

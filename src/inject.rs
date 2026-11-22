@@ -48,22 +48,17 @@ pub fn capture_foreground_window() -> isize {
 }
 
 #[cfg(windows)]
-pub fn restore_foreground_window(hwnd: isize) {
-    if hwnd == 0 {
-        return;
-    }
-    use windows_sys::Win32::Foundation::HWND;
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SetForegroundWindow};
-    unsafe {
-        if GetForegroundWindow() as isize == hwnd {
-            return;
-        }
-        let _ = SetForegroundWindow(hwnd as HWND);
-    }
+pub fn is_native_window(window: &winit::window::Window, hwnd: isize) -> bool {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    window.window_handle().is_ok_and(|handle| {
+        matches!(handle.as_raw(), RawWindowHandle::Win32(win32) if win32.hwnd.get() == hwnd)
+    })
 }
 
 #[cfg(not(windows))]
-pub fn restore_foreground_window(_hwnd: isize) {}
+pub fn is_native_window(_window: &winit::window::Window, _hwnd: isize) -> bool {
+    false
+}
 
 /// Style the floating speech overlay so it sits on top of any input in the system
 /// without stealing keyboard focus (`WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST`),
@@ -159,7 +154,7 @@ pub fn set_overlay_visible_no_activate(window: &winit::window::Window, visible: 
 }
 
 #[cfg(windows)]
-fn wait_for_modifiers_released(max_wait: Duration) {
+fn wait_for_modifiers_released(max_wait: Duration) -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         GetAsyncKeyState, VK_CONTROL, VK_MENU, VK_SHIFT, VK_SPACE,
     };
@@ -167,46 +162,63 @@ fn wait_for_modifiers_released(max_wait: Duration) {
         unsafe { (GetAsyncKeyState(i32::from(vk)) as u16 & 0x8000) != 0 }
     };
     let start = Instant::now();
-    while start.elapsed() < max_wait {
-        if !is_down(VK_CONTROL) && !is_down(VK_SHIFT) && !is_down(VK_MENU) && !is_down(VK_SPACE) {
-            break;
+    while is_down(VK_CONTROL) || is_down(VK_SHIFT) || is_down(VK_MENU) || is_down(VK_SPACE) {
+        if start.elapsed() >= max_wait {
+            return false;
         }
         std::thread::sleep(Duration::from_millis(12));
     }
+    true
 }
 
 #[cfg(not(windows))]
-fn wait_for_modifiers_released(_max_wait: Duration) {}
+fn wait_for_modifiers_released(_max_wait: Duration) -> bool {
+    false
+}
 
-/// Deliver transcribed text according to the user's selected `DeliveryMode`,
-/// preserving or restoring focus to `target_hwnd` before pasting/typing.
-pub fn deliver_transcript(text: &str, mode: DeliveryMode, target_hwnd: Option<isize>) -> Result<String> {
-    if text.trim().is_empty() {
-        return Ok("Empty transcript".to_string());
-    }
+/// Copy every transcript and only insert into the original, still-focused window.
+pub fn deliver_transcript(
+    text: &str,
+    mode: DeliveryMode,
+    target_hwnd: Option<isize>,
+    is_realtime_clause: bool,
+) -> Result<String> {
     copy_to_clipboard(text)?;
-
-    match mode {
-        DeliveryMode::ClipboardOnly => Ok("Copied to clipboard".to_string()),
-        DeliveryMode::PasteAndClipboard => {
-            if let Some(hwnd) = target_hwnd {
-                restore_foreground_window(hwnd);
-            }
-            wait_for_modifiers_released(Duration::from_millis(180));
-            std::thread::sleep(Duration::from_millis(40));
-            send_ctrl_v()?;
-            Ok("Copied & pasted (Ctrl+V) into active window".to_string())
-        }
-        DeliveryMode::TypeAndClipboard => {
-            if let Some(hwnd) = target_hwnd {
-                restore_foreground_window(hwnd);
-            }
-            wait_for_modifiers_released(Duration::from_millis(180));
-            std::thread::sleep(Duration::from_millis(40));
-            type_unicode_text(text)?;
-            Ok("Copied & typed into active window".to_string())
-        }
+    let Some(target) = target_hwnd.filter(|_| mode != DeliveryMode::ClipboardOnly) else {
+        return Ok("Copied to clipboard".into());
+    };
+    if !wait_for_modifiers_released(Duration::from_millis(180)) {
+        return Ok("Copied to clipboard. Shortcut keys were still held.".into());
     }
+    if capture_foreground_window() != target {
+        return Ok("Copied to clipboard. The original window lost focus.".into());
+    }
+
+    let live_text;
+    let text = if is_realtime_clause {
+        live_text = format!("{} ", text.trim());
+        &live_text
+    } else {
+        text
+    };
+
+    let (result, message) = match mode {
+        DeliveryMode::ClipboardOnly => return Ok("Copied to clipboard".into()),
+        DeliveryMode::PasteAndClipboard => {
+            if is_realtime_clause {
+                copy_to_clipboard(text)?;
+                if capture_foreground_window() != target {
+                    return Ok("Copied to clipboard. The original window lost focus.".into());
+                }
+            }
+            (send_ctrl_v(), "Paste shortcut sent · copied to clipboard")
+        }
+        DeliveryMode::TypeAndClipboard => (type_unicode_text(text), "Typed · copied to clipboard"),
+    };
+    Ok(result.map_or_else(
+        |err| format!("Copied to clipboard. {err}"),
+        |()| message.into(),
+    ))
 }
 
 #[cfg(windows)]
@@ -311,8 +323,10 @@ pub enum GlobalHotkeyEvent {
 
 /// Spawn a background thread detecting both Press and Release of `Ctrl+Shift+Space`
 /// globally across all applications.
-pub fn spawn_global_hotkey_listener() -> mpsc::Receiver<GlobalHotkeyEvent> {
-    let (tx, rx) = mpsc::channel();
+pub fn spawn_global_hotkey_listener(
+    wake: winit::event_loop::EventLoopProxy<()>,
+) -> mpsc::Receiver<GlobalHotkeyEvent> {
+    let (tx, rx) = crate::event_channel(wake);
 
     #[cfg(windows)]
     std::thread::spawn(move || {

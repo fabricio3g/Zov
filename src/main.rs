@@ -3,6 +3,7 @@ mod catalog;
 mod config;
 mod engine;
 mod gpu_ui;
+mod icon_motion;
 mod inject;
 mod style;
 mod tray;
@@ -10,35 +11,37 @@ mod ui;
 mod vad;
 mod wav;
 
-use crate::audio::{list_input_devices, start_recording, ActiveRecording};
+use crate::audio::{list_input_devices, start_recording, ActiveRecording, CompletedRecording};
 use crate::catalog::{
-    find_commercial_provider, find_local_whisper_spec, LocalEngineKind, COMMERCIAL_STT_PROVIDERS,
+    find_commercial_provider, find_local_whisper_spec, UnifiedSttChoice, COMMERCIAL_STT_PROVIDERS,
     COMMERCIAL_TTS_CATALOG, LOCAL_WHISPER_CATALOG,
 };
 use crate::config::{load_history, save_history, AppPaths, DictateConfig, HistoryEntry, HotkeyMode};
 use crate::engine::{
-    check_local_whisper_model, has_nvidia_gpu, installed_local_models, is_local_engine_ready,
-    resolve_audiocpp_binary, resolve_whisper_binary, setup_local_whisper, stop_whisper_server,
-    transcribe_wav, TranscriptionOutput,
+    check_local_whisper_model, discard_download, has_nvidia_gpu, install_controlled,
+    installed_local_models, is_local_engine_ready, resolve_audiocpp_binary, resolve_whisper_binary,
+    setup_local_whisper, stop_whisper_server, transcribe_wav, DownloadCommand, DownloadOutcome,
+    InstallStatus, InstallTarget, LocalInventory, TranscriptionOutput,
 };
 use crate::gpu_ui::{DrawList, GpuContext, GpuWindowRenderer, TextEngine};
 use crate::inject::{
-    configure_overlay_window_no_activate, copy_to_clipboard, deliver_transcript,
+    configure_overlay_window_no_activate, copy_to_clipboard, deliver_transcript, is_native_window,
     paste_from_clipboard, set_overlay_visible_no_activate, spawn_global_hotkey_listener,
-    type_unicode_text, GlobalHotkeyEvent,
+    GlobalHotkeyEvent,
 };
-use crate::style::{palette, set_theme, toggle_theme, Rgba, Theme};
+use crate::style::{palette, set_theme, toggle_theme, window_border_color, Rgba, Theme};
 use crate::tray::{create_winit_window_icon, spawn_tray_icon, TrayEvent};
 use crate::ui::{
-    filtered_stt_choices, hit_test, render_main_window, render_overlay_pill, AppView,
-    DictationPhase, HitTarget, HitZone, Modal, ModelFilterTab, ProviderField, ScrollList,
-    UiSnapshot,
+    filtered_stt_choices, hit_test, render_main_window, render_overlay_pill, AppView, ComposerMenu,
+    DictationPhase, DownloadJob, DownloadState, HitTarget, HitZone, Modal, ModelFilterTab,
+    ProviderField, ScrollList, UiSnapshot,
 };
 use crate::vad::HISTORY_BARS;
 use crate::wav::load_wav_normalized;
 use anyhow::Result;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{mpsc, Arc};
@@ -46,15 +49,42 @@ use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, ResizeDirection, Window, WindowId, WindowLevel};
+
+const APP_NAME: &str = "Zov";
+const FRAME_INTERVAL: Duration = Duration::from_nanos(16_666_667);
+const CARET_INTERVAL_MS: u128 = 530;
+
+fn hover_progress(elapsed: Duration) -> f32 {
+    let progress = (elapsed.as_secs_f32() / 0.11).min(1.0);
+    1.0 - (1.0 - progress).powi(3)
+}
+
+struct WakeSender<T> {
+    sender: mpsc::Sender<T>,
+    event_loop: EventLoopProxy<()>,
+}
+
+impl<T> WakeSender<T> {
+    fn send(&self, message: T) -> Result<(), mpsc::SendError<T>> {
+        self.sender.send(message)?;
+        let _ = self.event_loop.send_event(());
+        Ok(())
+    }
+}
+
+fn event_channel<T>(event_loop: EventLoopProxy<()>) -> (Arc<WakeSender<T>>, mpsc::Receiver<T>) {
+    let (sender, receiver) = mpsc::channel();
+    (Arc::new(WakeSender { sender, event_loop }), receiver)
+}
 
 #[derive(Parser)]
 #[command(
     name = "enio",
     version,
-    about = "Enio — Native GPU-accelerated desktop dictation app with floating system overlay (Non-Whisper + Whisper + Hugging Face + 15 Commercial STTs)"
+    about = "Zov — Native desktop dictation with on-device and cloud transcription"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -85,14 +115,171 @@ enum Commands {
 }
 
 enum WorkerMessage {
-    InstallProgress { label: String, progress: u8 },
-    InstallDone(Result<String, String>),
+    InstallProgress(InstallStatus),
+    InstallDone {
+        target: InstallTarget,
+        result: Result<DownloadOutcome, String>,
+        previous_selection: (String, String, String),
+    },
     TranscriptionDone {
+        session_id: uuid::Uuid,
         duration_secs: f32,
         is_realtime_clause: bool,
-        target_hwnd: Option<isize>,
         result: Result<TranscriptionOutput, String>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureSource {
+    Window,
+    Tray,
+    Hotkey(isize),
+}
+
+impl CaptureSource {
+    fn release_stops(self, mode: HotkeyMode, held_ms: u64) -> bool {
+        matches!(self, Self::Hotkey(_))
+            && (mode == HotkeyMode::HoldToTalk
+                || (mode == HotkeyMode::SmartHoldOrTap && held_ms >= 350))
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[test]
+    fn only_hotkey_started_recordings_stop_on_hotkey_release() {
+        assert!(!CaptureSource::Window.release_stops(HotkeyMode::HoldToTalk, 550));
+        assert!(!CaptureSource::Tray.release_stops(HotkeyMode::SmartHoldOrTap, 550));
+        let hotkey = CaptureSource::Hotkey(1);
+        assert!(hotkey.release_stops(HotkeyMode::HoldToTalk, 80));
+        assert!(!hotkey.release_stops(HotkeyMode::SmartHoldOrTap, 349));
+        assert!(hotkey.release_stops(HotkeyMode::SmartHoldOrTap, 350));
+        assert!(!hotkey.release_stops(HotkeyMode::RealTimeStreaming, 550));
+    }
+}
+
+struct DictationSession {
+    id: uuid::Uuid,
+    config: DictateConfig,
+    source: CaptureSource,
+    queue: VecDeque<(CompletedRecording, bool)>,
+    error: Option<String>,
+}
+
+struct Transition<T> {
+    key: Option<T>,
+    since: Option<Instant>,
+}
+
+impl<T> Default for Transition<T> {
+    fn default() -> Self {
+        Self {
+            key: None,
+            since: None,
+        }
+    }
+}
+
+impl<T: PartialEq> Transition<T> {
+    fn update(&mut self, key: T, now: Instant) {
+        if self.key.as_ref() != Some(&key) {
+            self.since = self.key.as_ref().map(|_| now);
+            self.key = Some(key);
+        }
+    }
+
+    fn value(&self, now: Instant, duration_ms: f32) -> f32 {
+        let t = self.since.map_or(1.0, |since| {
+            (now.saturating_duration_since(since).as_secs_f32() * 1000.0 / duration_ms).min(1.0)
+        });
+        1.0 - (1.0 - t).powi(3)
+    }
+}
+
+struct UiTransitions {
+    enabled: bool,
+    clock: Instant,
+    page: Transition<AppView>,
+    popup: Transition<Option<ComposerMenu>>,
+    modal: Transition<std::mem::Discriminant<Modal>>,
+    dictation: Transition<(std::mem::Discriminant<DictationPhase>, bool)>,
+    download: Transition<f32>,
+    download_from: f32,
+}
+
+impl UiTransitions {
+    fn new() -> Self {
+        Self {
+            enabled: interface_animations_enabled(),
+            clock: Instant::now(),
+            page: Transition::default(),
+            popup: Transition::default(),
+            modal: Transition::default(),
+            dictation: Transition::default(),
+            download: Transition::default(),
+            download_from: 0.0,
+        }
+    }
+
+    fn animating(&self, now: Instant) -> bool {
+        self.enabled
+            && [
+                self.page.since,
+                self.popup.since,
+                self.modal.since,
+                self.dictation.since,
+                self.download.since,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|started| now.saturating_duration_since(started) < Duration::from_millis(255))
+    }
+
+    fn update_download(&mut self, fraction: Option<f32>, now: Instant) -> Option<f32> {
+        let Some(fraction) = fraction else {
+            self.download = Transition::default();
+            self.download_from = 0.0;
+            return None;
+        };
+        let previous = self.download.key.unwrap_or(fraction);
+        if fraction < previous {
+            self.download = Transition::default();
+        }
+        if self.download.key != Some(fraction) {
+            self.download_from = self.download_from
+                + (previous - self.download_from) * self.download.value(now, 200.0);
+            self.download.update(fraction, now);
+        }
+        Some(if self.enabled {
+            self.download_from + (fraction - self.download_from) * self.download.value(now, 200.0)
+        } else {
+            fraction
+        })
+    }
+}
+
+#[cfg(windows)]
+fn interface_animations_enabled() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        SystemParametersInfoW, SPI_GETCLIENTAREAANIMATION,
+    };
+    let mut enabled = 1i32;
+    unsafe {
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            (&mut enabled as *mut i32).cast(),
+            0,
+        );
+    }
+    enabled != 0
+}
+
+#[cfg(not(windows))]
+fn interface_animations_enabled() -> bool {
+    true
 }
 
 fn main() -> Result<()> {
@@ -142,8 +329,12 @@ fn main() -> Result<()> {
         }
         Some(Commands::Setup { model }) => {
             println!("Setting up local engine + model '{model}'…");
-            rt.block_on(setup_local_whisper(&paths, &cfg, &model, |msg, pct| {
-                println!("[{pct:>3}%] {msg}");
+            rt.block_on(setup_local_whisper(&paths, &cfg, &model, |status| {
+                if let Some(progress) = status.transfer() {
+                    println!("{} · {}", status.label(), progress.label());
+                } else {
+                    println!("{}", status.label());
+                }
             }))?;
             cfg.backend = "local".to_string();
             cfg.local_model = model;
@@ -176,7 +367,8 @@ fn main() -> Result<()> {
     }
 
     let event_loop = EventLoop::new()?;
-    let mut app = DictateDesktopApp::new(paths, cfg, rt.handle().clone());
+    let mut app =
+        DictateDesktopApp::new(paths, cfg, rt.handle().clone(), event_loop.create_proxy());
     let res = event_loop.run_app(&mut app);
     stop_whisper_server();
     res?;
@@ -189,7 +381,7 @@ fn print_status(paths: &AppPaths, cfg: &DictateConfig) {
     let installed = installed_local_models(paths);
     let microphones = list_input_devices();
     let hf_ready = !cfg.resolve_hf_token().is_empty();
-    println!("Enio — System Status");
+    println!("{APP_NAME} — System Status");
     println!("  Data folder      : {}", paths.root.display());
     println!("  Active engine    : {}", cfg.active_summary());
     println!("  Hotkey mode      : {}", cfg.hotkey_mode.label());
@@ -275,6 +467,15 @@ fn print_models(paths: &AppPaths, cfg: &DictateConfig) {
 // GPU-ACCELERATED DUAL-WINDOW DESKTOP APPLICATION
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+struct ModelChoices {
+    tab: ModelFilterTab,
+    filter: String,
+    backend: String,
+    local_model: String,
+    commercial_model: String,
+    rows: Vec<UnifiedSttChoice>,
+}
+
 struct DictateDesktopApp {
     paths: AppPaths,
     config: DictateConfig,
@@ -292,20 +493,27 @@ struct DictateDesktopApp {
     overlay_draw: DrawList,
     overlay_text: TextEngine,
     overlay_visible: bool,
+    overlay_hide_at: Option<Instant>,
     // Navigation & UI state
     view: AppView,
     model_tab: ModelFilterTab,
     model_filter: String,
     model_search_focused: bool,
-    model_dropdown_open: bool,
+    composer_menu: Option<ComposerMenu>,
     caret_blink_at: Instant,
     last_caret_on: bool,
     model_selected: usize,
     model_scroll: usize,
+    inventory: LocalInventory,
+    model_choices: Option<ModelChoices>,
+    settings_scroll: usize,
     hits: Vec<HitZone>,
     mouse_pos: (f32, f32),
     last_hovered: Option<HitTarget>,
+    leaving_hover: Option<(HitTarget, f32)>,
     hover_started_at: Instant,
+    transitions: UiTransitions,
+    next_frame_at: Instant,
     pressed_target: Option<HitTarget>,
     dragging_scrollbar: Option<(ScrollList, f32, f32, usize, usize)>,
     last_cursor: CursorIcon,
@@ -314,8 +522,11 @@ struct DictateDesktopApp {
     // Background workers, system tray & global hotkey
     hotkey_rx: mpsc::Receiver<GlobalHotkeyEvent>,
     tray_rx: mpsc::Receiver<TrayEvent>,
-    worker_tx: mpsc::Sender<WorkerMessage>,
+    worker_tx: Arc<WakeSender<WorkerMessage>>,
     worker_rx: mpsc::Receiver<WorkerMessage>,
+    download: Option<DownloadJob>,
+    recent_downloads: Vec<InstallTarget>,
+    download_command: Option<tokio::sync::watch::Sender<DownloadCommand>>,
     available_mics: Vec<String>,
     should_exit: bool,
     history: Vec<HistoryEntry>,
@@ -325,13 +536,13 @@ struct DictateDesktopApp {
     modal: Modal,
     status_toast: Option<String>,
     active_recording: Option<ActiveRecording>,
-    target_hwnd: Option<isize>,
+    session: Option<DictationSession>,
+    pending_transcription: Option<uuid::Uuid>,
     live_preview: String,
     audio_levels: [f32; 15],
     history_bars: Vec<f32>,
     vad_speaking: bool,
     elapsed_secs: u64,
-    active_mic_name: String,
 }
 
 impl DictateDesktopApp {
@@ -339,19 +550,16 @@ impl DictateDesktopApp {
         paths: AppPaths,
         config: DictateConfig,
         rt_handle: tokio::runtime::Handle,
+        wake: EventLoopProxy<()>,
     ) -> Self {
-        let hotkey_rx = spawn_global_hotkey_listener();
-        let tray_rx = spawn_tray_icon();
-        let (worker_tx, worker_rx) = mpsc::channel();
+        let hotkey_rx = spawn_global_hotkey_listener(wake.clone());
+        let tray_rx = spawn_tray_icon(wake.clone());
+        let (worker_tx, worker_rx) = event_channel(wake);
         let history = load_history(&paths);
         let available_mics = list_input_devices();
-        let active_mic_name = config
-            .audio_device
-            .clone()
-            .filter(|d| !d.trim().is_empty())
-            .or_else(|| available_mics.first().cloned())
-            .unwrap_or_else(|| "Default Microphone".to_string());
-
+        let inventory = LocalInventory::scan(&paths, &config);
+        let main_text = TextEngine::new();
+        let overlay_text = main_text.for_other_window();
         Self {
             paths,
             config,
@@ -360,25 +568,32 @@ impl DictateDesktopApp {
             main_window: None,
             main_renderer: None,
             main_draw: DrawList::new(1.0),
-            main_text: TextEngine::new(),
+            main_text,
             overlay_window: None,
             overlay_renderer: None,
             overlay_draw: DrawList::new(1.0),
-            overlay_text: TextEngine::new(),
+            overlay_text,
             overlay_visible: false,
+            overlay_hide_at: None,
             view: AppView::Dictate,
             model_tab: ModelFilterTab::All,
             model_filter: String::new(),
             model_search_focused: false,
-            model_dropdown_open: false,
+            composer_menu: None,
             caret_blink_at: Instant::now(),
             last_caret_on: true,
             model_selected: 0,
             model_scroll: 0,
+            inventory,
+            model_choices: None,
+            settings_scroll: 0,
             hits: Vec::new(),
             mouse_pos: (-1.0, -1.0),
             last_hovered: None,
+            leaving_hover: None,
             hover_started_at: Instant::now(),
+            transitions: UiTransitions::new(),
+            next_frame_at: Instant::now(),
             pressed_target: None,
             dragging_scrollbar: None,
             last_cursor: CursorIcon::Default,
@@ -388,6 +603,9 @@ impl DictateDesktopApp {
             tray_rx,
             worker_tx,
             worker_rx,
+            download: None,
+            recent_downloads: Vec::new(),
+            download_command: None,
             available_mics,
             should_exit: false,
             history,
@@ -397,14 +615,47 @@ impl DictateDesktopApp {
             modal: Modal::None,
             status_toast: None,
             active_recording: None,
-            target_hwnd: None,
+            session: None,
+            pending_transcription: None,
             live_preview: String::new(),
             audio_levels: [0.0; 15],
             history_bars: vec![0.0; HISTORY_BARS],
             vad_speaking: false,
             elapsed_secs: 0,
-            active_mic_name,
         }
+    }
+
+    fn refresh_inventory(&mut self) {
+        let inventory = LocalInventory::scan(&self.paths, &self.config);
+        if inventory != self.inventory {
+            self.inventory = inventory;
+            self.model_choices = None;
+        }
+    }
+
+    fn sync_model_choices(&mut self) {
+        if self.model_choices.as_ref().is_some_and(|cache| {
+            cache.tab == self.model_tab
+                && cache.filter == self.model_filter
+                && cache.backend == self.config.backend
+                && cache.local_model == self.config.local_model
+                && cache.commercial_model == self.config.commercial_model
+        }) {
+            return;
+        }
+        self.model_choices = Some(ModelChoices {
+            tab: self.model_tab,
+            filter: self.model_filter.clone(),
+            backend: self.config.backend.clone(),
+            local_model: self.config.local_model.clone(),
+            commercial_model: self.config.commercial_model.clone(),
+            rows: filtered_stt_choices(
+                &self.inventory,
+                &self.config,
+                self.model_tab,
+                &self.model_filter,
+            ),
+        });
     }
 
     fn apply_scrollbar_y(
@@ -420,18 +671,52 @@ impl DictateDesktopApp {
             return;
         }
         let max_scroll = total.saturating_sub(visible);
-        let thumb_h = (track_h * (visible as f32 / total as f32)).clamp(28.0, track_h);
+        let thumb_h = (track_h * (visible as f32 / total as f32))
+            .max(28.0)
+            .min(track_h);
         let usable = (track_h - thumb_h).max(1.0);
         let ratio = ((mouse_y - track_y - thumb_h * 0.5) / usable).clamp(0.0, 1.0);
         let next = (ratio * max_scroll as f32).round() as usize;
         match list {
             ScrollList::Models => self.model_scroll = next.min(max_scroll),
             ScrollList::History => self.history_scroll = next.min(max_scroll),
+            ScrollList::Settings => self.settings_scroll = next,
+            ScrollList::Transcript => {
+                if let Modal::Transcript { scroll, .. } = &mut self.modal {
+                    *scroll = next;
+                }
+            }
+        }
+    }
+
+    fn scroll_limit(hits: &[HitZone], list: ScrollList) -> usize {
+        hits.iter()
+            .find_map(|zone| match zone.target {
+                HitTarget::Scrollbar {
+                    list: target,
+                    total,
+                    visible,
+                    ..
+                } if target == list => Some(total.saturating_sub(visible)),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    fn scroll_transcript(&mut self, step: isize) {
+        if let Modal::Transcript { scroll, .. } = &mut self.modal {
+            let limit = Self::scroll_limit(&self.hits, ScrollList::Transcript);
+            *scroll = scroll.saturating_add_signed(step).min(limit);
+            self.request_redraws();
         }
     }
 
     fn request_redraws(&self) {
-        if let Some(win) = &self.main_window {
+        if let Some(win) = self
+            .main_window
+            .as_ref()
+            .filter(|win| win.is_visible() != Some(false) && win.is_minimized() != Some(true))
+        {
             win.request_redraw();
         }
         if self.overlay_visible {
@@ -441,7 +726,18 @@ impl DictateDesktopApp {
         }
     }
 
+    fn update_hover(&mut self, target: Option<HitTarget>) {
+        if self.last_hovered != target {
+            let previous = std::mem::replace(&mut self.last_hovered, target);
+            self.leaving_hover = previous
+                .map(|previous| (previous, hover_progress(self.hover_started_at.elapsed())));
+            self.hover_started_at = Instant::now();
+            self.request_redraws();
+        }
+    }
+
     fn set_overlay_visible(&mut self, visible: bool) {
+        self.overlay_hide_at = None;
         if self.overlay_visible == visible {
             return;
         }
@@ -454,68 +750,136 @@ impl DictateDesktopApp {
         }
     }
 
-    fn start_local_install(&mut self, model_id: String) {
-        self.phase = DictationPhase::Installing {
-            label: format!("Installing {model_id}"),
-            progress: 0,
-        };
+    fn start_local_install(&mut self, target: InstallTarget) {
+        if self.download_command.is_some() {
+            return;
+        }
+        let progress = self
+            .download
+            .as_ref()
+            .filter(|job| job.target == target)
+            .and_then(|job| job.progress);
+        self.status_toast = None;
+        self.download = Some(DownloadJob {
+            target: target.clone(),
+            state: DownloadState::Running(InstallStatus::Checking),
+            progress,
+            stopping: false,
+        });
+        let (command, commands) = tokio::sync::watch::channel(DownloadCommand::Run);
+        self.download_command = Some(command);
         let tx = self.worker_tx.clone();
         let paths_clone = self.paths.clone();
         let cfg_clone = self.config.clone();
+        let previous_selection = (
+            cfg_clone.backend.clone(),
+            cfg_clone.local_model.clone(),
+            cfg_clone.commercial_model.clone(),
+        );
         self.rt_handle.spawn(async move {
             let tx_p = tx.clone();
-            let res = setup_local_whisper(&paths_clone, &cfg_clone, &model_id, move |lbl, pct| {
-                let _ = tx_p.send(WorkerMessage::InstallProgress {
-                    label: lbl,
-                    progress: pct,
-                });
-            })
-            .await
-            .map(|()| model_id)
-            .map_err(|e| e.to_string());
-            let _ = tx.send(WorkerMessage::InstallDone(res));
+            let result =
+                install_controlled(&paths_clone, &cfg_clone, &target, commands, move |status| {
+                    let _ = tx_p.send(WorkerMessage::InstallProgress(status));
+                })
+                .await
+                .map_err(|e| e.to_string());
+            let _ = tx.send(WorkerMessage::InstallDone {
+                target,
+                result,
+                previous_selection,
+            });
         });
         self.request_redraws();
     }
 
-    fn dispatch_transcription(
-        &self,
-        wav_bytes: Vec<u8>,
-        duration_secs: f32,
-        is_realtime_clause: bool,
-        target_hwnd: Option<isize>,
-    ) {
+    fn download_is_pending(&self) -> bool {
+        self.download.as_ref().is_some_and(|job| {
+            matches!(job.state, DownloadState::Running(_) | DownloadState::Paused)
+        })
+    }
+
+    fn control_download(&mut self, command: DownloadCommand) {
+        let Some(job) = &mut self.download else {
+            return;
+        };
+        let allowed = match command {
+            DownloadCommand::Pause => job.can_pause(),
+            DownloadCommand::Cancel => job.can_cancel(),
+            DownloadCommand::Run => false,
+        };
+        if !allowed {
+            return;
+        }
+        if let Some(sender) = &self.download_command {
+            job.stopping = sender.send(command).is_ok();
+        } else if command == DownloadCommand::Cancel {
+            job.state = match discard_download(&self.paths, &job.target) {
+                Ok(()) => {
+                    job.progress = None;
+                    DownloadState::Canceled
+                }
+                Err(err) => DownloadState::Failed(err.to_string()),
+            };
+        }
+    }
+
+    fn dispatch_next_transcription(&mut self) {
+        if self.pending_transcription.is_some() {
+            return;
+        }
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        let Some((recording, is_realtime_clause)) = session.queue.pop_front() else {
+            return;
+        };
+        let session_id = session.id;
+        self.pending_transcription = Some(session_id);
         let tx = self.worker_tx.clone();
         let paths_clone = self.paths.clone();
-        let cfg_clone = self.config.clone();
+        let cfg_clone = session.config.clone();
         self.rt_handle.spawn(async move {
-            let res = transcribe_wav(&paths_clone, &cfg_clone, &wav_bytes)
+            let res = transcribe_wav(&paths_clone, &cfg_clone, &recording.wav_bytes)
                 .await
                 .map_err(|e| e.to_string());
             let _ = tx.send(WorkerMessage::TranscriptionDone {
-                duration_secs,
+                session_id,
+                duration_secs: recording.duration_secs,
                 is_realtime_clause,
-                target_hwnd,
                 result: res,
             });
         });
     }
 
-    fn start_capture(&mut self, target_hwnd: Option<isize>, show_overlay: bool) {
-        if self.active_recording.is_some()
-            || matches!(
-                self.phase,
-                DictationPhase::Transcribing | DictationPhase::Installing { .. }
-            )
-        {
+    fn start_capture(&mut self, source: CaptureSource) {
+        if self.session.is_some() {
             return;
         }
 
-        if self.config.backend == "local" && !is_local_engine_ready(&self.paths, &self.config) {
-            self.start_local_install(self.config.local_model.clone());
+        let local = self.config.backend == "local";
+        let ready = if local {
+            is_local_engine_ready(&self.paths, &self.config)
+        } else {
+            self.config.has_api_key(&self.config.backend)
+        };
+        if !ready {
+            if source == CaptureSource::Window {
+                if local {
+                    self.open_confirm_download_modal(self.config.local_model.clone());
+                } else {
+                    self.open_provider_config_modal(self.config.backend.clone(), None);
+                }
+            } else {
+                self.phase = DictationPhase::SetupRequired;
+                self.set_overlay_visible(true);
+                self.overlay_hide_at = Some(Instant::now() + Duration::from_secs(4));
+                self.request_redraws();
+            }
             return;
         }
 
+        self.status_toast = None;
         let realtime = self.config.hotkey_mode == HotkeyMode::RealTimeStreaming;
         match start_recording(
             self.config.audio_device.as_deref(),
@@ -523,51 +887,93 @@ impl DictateDesktopApp {
             realtime,
         ) {
             Ok(rec) => {
-                self.active_mic_name = rec.device_name.clone();
                 self.active_recording = Some(rec);
-                self.target_hwnd = target_hwnd;
+                self.session = Some(DictationSession {
+                    id: uuid::Uuid::new_v4(),
+                    config: self.config.clone(),
+                    source,
+                    queue: VecDeque::new(),
+                    error: None,
+                });
                 self.live_preview.clear();
                 self.phase = DictationPhase::Recording;
-                self.status_toast = Some("Listening…".to_string());
-                if show_overlay {
-                    self.set_overlay_visible(true);
-                }
+                self.set_overlay_visible(source != CaptureSource::Window);
             }
             Err(err) => {
-                self.phase = DictationPhase::Error(err.to_string());
-                self.status_toast = Some(format!("Mic error: {err}"));
+                self.phase = DictationPhase::Error(format!("Microphone unavailable. {err}"));
+                if source != CaptureSource::Window {
+                    self.set_overlay_visible(true);
+                    self.overlay_hide_at = Some(Instant::now() + Duration::from_secs(4));
+                }
             }
         }
         self.request_redraws();
     }
 
     fn stop_capture_and_transcribe(&mut self) {
-        if let Some(rec) = self.active_recording.take() {
-            if let Some(done) = rec.finish() {
-                self.phase = DictationPhase::Transcribing;
-                self.dispatch_transcription(
-                    done.wav_bytes,
-                    done.duration_secs,
-                    false,
-                    self.target_hwnd,
-                );
-            } else {
-                self.phase = DictationPhase::Idle;
-                self.set_overlay_visible(false);
+        if let Some(mut rec) = self.active_recording.take() {
+            let session = self.session.as_mut().expect("recording has a session");
+            rec.stop_capture();
+            while let Some(clause) = rec.take_completed_clause() {
+                session.queue.push_back((clause, true));
             }
+            if let Some(done) = rec.finish() {
+                session.queue.push_back((done, false));
+            }
+            self.phase = DictationPhase::Transcribing;
+            self.dispatch_next_transcription();
+            self.finish_session_if_drained();
             self.request_redraws();
         }
     }
 
-    fn toggle_recording(&mut self, target_hwnd: Option<isize>, show_overlay: bool) {
-        if self.active_recording.is_some() {
-            self.stop_capture_and_transcribe();
-        } else {
-            self.start_capture(target_hwnd, show_overlay);
+    fn finish_session_if_drained(&mut self) {
+        if self.active_recording.is_some()
+            || self.session.as_ref().is_none_or(|session| {
+                self.pending_transcription == Some(session.id) || !session.queue.is_empty()
+            })
+        {
+            return;
+        }
+        let error = self.session.take().and_then(|session| session.error);
+        self.phase = error.map_or(DictationPhase::Idle, DictationPhase::Error);
+        if self.live_preview.is_empty() && matches!(self.phase, DictationPhase::Idle) {
+            self.status_toast =
+                Some("No speech captured. Try speaking closer to the microphone.".into());
+        }
+        if self.overlay_visible {
+            let seconds = if matches!(self.phase, DictationPhase::Error(_)) {
+                4
+            } else {
+                3
+            };
+            self.overlay_hide_at = Some(Instant::now() + Duration::from_secs(seconds));
         }
     }
 
-    fn open_provider_config_modal(&mut self, provider_id: String) {
+    fn cancel_recording(&mut self) {
+        self.active_recording = None;
+        self.session = None;
+        self.phase = DictationPhase::Idle;
+        let message = if self.live_preview.is_empty() {
+            "Dictation canceled"
+        } else {
+            "Dictation stopped. Previously transcribed phrases are in history."
+        };
+        self.status_toast = Some(message.into());
+        self.set_overlay_visible(false);
+        self.request_redraws();
+    }
+
+    fn toggle_recording(&mut self, source: CaptureSource) {
+        if self.active_recording.is_some() {
+            self.stop_capture_and_transcribe();
+        } else {
+            self.start_capture(source);
+        }
+    }
+
+    fn open_provider_config_modal(&mut self, provider_id: String, select_model: Option<String>) {
         let spec = find_commercial_provider(&provider_id);
         let pname = spec
             .map(|p| p.name.to_string())
@@ -590,17 +996,13 @@ impl DictateDesktopApp {
                     String::new()
                 }
             });
-        let model_id = saved
-            .map(|p| p.model.clone())
-            .filter(|m| !m.trim().is_empty())
-            .unwrap_or_else(|| {
-                if self.config.backend == provider_id && !self.config.commercial_model.is_empty() {
-                    self.config.commercial_model.clone()
-                } else {
-                    spec.map(|p| p.default_model.to_string()).unwrap_or_default()
-                }
-            });
-        self.model_dropdown_open = false;
+        let model_id = select_model.clone().unwrap_or_else(|| {
+            self.config
+                .resolve_commercial_auth(&provider_id)
+                .map(|(_, _, model)| model)
+                .unwrap_or_default()
+        });
+        self.composer_menu = None;
         self.caret_blink_at = Instant::now();
         self.last_caret_on = true;
         self.modal = Modal::ProviderConfig {
@@ -616,41 +1018,59 @@ impl DictateDesktopApp {
                 ProviderField::ApiKey
             },
             reveal_key: false,
+            select_model,
         };
         self.request_redraws();
     }
 
     fn open_confirm_download_modal(&mut self, model_id: String) {
-        let spec = find_local_whisper_spec(&model_id);
-        let label = spec
-            .map(|s| s.label.to_string())
-            .unwrap_or_else(|| model_id.clone());
-        let size_mb = spec.map(|s| s.size_mb).unwrap_or(190);
-        let engine_name = spec
-            .map(|s| match s.engine {
-                LocalEngineKind::AudioCpp => "audio.cpp",
-                LocalEngineKind::WhisperCpp => "whisper.cpp",
-            })
-            .unwrap_or("whisper.cpp")
-            .to_string();
-        self.model_dropdown_open = false;
-        self.modal = Modal::ConfirmDownload {
-            model_id,
-            label,
-            size_mb,
-            engine_name,
-        };
+        self.open_install_confirmation(InstallTarget::Model(model_id));
+    }
+
+    fn open_install_confirmation(&mut self, target: InstallTarget) {
+        if self.download_is_pending() {
+            if self
+                .download
+                .as_ref()
+                .is_some_and(|job| job.target != target)
+            {
+                self.status_toast = Some("Finish or cancel the current download first.".into());
+            }
+            self.composer_menu = None;
+            self.modal = Modal::Downloads;
+            self.request_redraws();
+            return;
+        }
+        if target
+            .model_id()
+            .is_some_and(|id| find_local_whisper_spec(id).is_none())
+        {
+            self.status_toast = Some("Select a supported speech model from Models.".into());
+            self.view = AppView::Models;
+            self.request_redraws();
+            return;
+        }
+        self.refresh_inventory();
+        if let InstallTarget::Engine(engine) = target {
+            if self.inventory.has_engine(engine) {
+                self.status_toast = Some(format!("{} is already installed.", engine.label()));
+                self.request_redraws();
+                return;
+            }
+        }
+        self.composer_menu = None;
+        self.modal = Modal::ConfirmDownload(target);
         self.request_redraws();
     }
 
     fn pick_model_index(&mut self, index: usize) {
-        let choices = filtered_stt_choices(
-            &self.paths,
-            &self.config,
-            self.model_tab,
-            &self.model_filter,
-        );
-        let Some(choice) = choices.get(index).cloned() else {
+        self.sync_model_choices();
+        let Some(choice) = self
+            .model_choices
+            .as_ref()
+            .and_then(|cache| cache.rows.get(index))
+            .cloned()
+        else {
             return;
         };
         self.model_selected = index;
@@ -666,20 +1086,17 @@ impl DictateDesktopApp {
                 self.config.backend = "local".to_string();
                 self.config.local_model = choice.model_id.clone();
                 self.config.save(&self.paths);
-                stop_whisper_server();
                 self.status_toast = Some(format!("Switched to {}", choice.model_id));
                 self.view = AppView::Dictate;
             }
-        } else {
-            self.config.backend = choice.backend.clone();
+        } else if self.config.has_api_key(&choice.backend) {
+            self.config.backend = choice.backend;
             self.config.commercial_model = choice.model_id.clone();
             self.config.save(&self.paths);
-            if !self.config.has_api_key(&choice.backend) {
-                self.open_provider_config_modal(choice.backend);
-            } else {
-                self.status_toast = Some(format!("Switched to {}", choice.model_id));
-                self.view = AppView::Dictate;
-            }
+            self.status_toast = Some(format!("Switched to {}", choice.model_id));
+            self.view = AppView::Dictate;
+        } else {
+            self.open_provider_config_modal(choice.backend, Some(choice.model_id));
         }
         self.request_redraws();
     }
@@ -724,41 +1141,84 @@ impl DictateDesktopApp {
                 return;
             }
             HitTarget::SwitchView(v) => {
+                if v == AppView::Models {
+                    self.refresh_inventory();
+                }
                 self.view = v;
-                self.model_dropdown_open = false;
+                self.composer_menu = None;
+                if self.modal == Modal::Downloads {
+                    self.modal = Modal::None;
+                }
             }
             HitTarget::ToggleRecord => {
-                self.model_dropdown_open = false;
-                self.toggle_recording(None, false);
+                self.composer_menu = None;
+                self.toggle_recording(CaptureSource::Window);
             }
-            HitTarget::ToggleModelDropdown => {
-                self.model_dropdown_open = !self.model_dropdown_open;
+            HitTarget::CancelRecording => {
+                if self.session.is_some() {
+                    self.cancel_recording();
+                }
             }
-            HitTarget::CloseModelDropdown => {
-                self.model_dropdown_open = false;
+            HitTarget::ToggleComposerMenu(menu) => {
+                self.composer_menu = (self.composer_menu != Some(menu)).then_some(menu);
+            }
+            HitTarget::CloseComposerMenu => {
+                self.composer_menu = None;
             }
             HitTarget::SelectDropdownLocal(model_id) => {
-                self.model_dropdown_open = false;
+                self.composer_menu = None;
                 self.config.backend = "local".to_string();
                 self.config.local_model = model_id.clone();
                 self.config.save(&self.paths);
-                stop_whisper_server();
                 self.status_toast = Some(format!("Switched to {model_id}"));
             }
             HitTarget::SelectDropdownCloud { backend, model_id } => {
-                self.model_dropdown_open = false;
+                self.composer_menu = None;
                 self.config.backend = backend;
                 self.config.commercial_model = model_id.clone();
                 self.config.save(&self.paths);
                 self.status_toast = Some(format!("Switched to {model_id}"));
             }
-            HitTarget::InstallLocalEngine => {
-                self.open_confirm_download_modal(self.config.local_model.clone());
+            HitTarget::DownloadLocalModel(id) => self.open_confirm_download_modal(id),
+            HitTarget::InstallEngine(engine) => {
+                self.open_install_confirmation(InstallTarget::Engine(engine))
             }
-            HitTarget::CycleLanguage => {
-                self.config.cycle_language();
+            HitTarget::OpenEngineSettings => {
+                self.refresh_inventory();
+                self.settings_scroll = 0;
+                self.composer_menu = None;
+                self.modal = Modal::None;
+                self.view = AppView::Settings;
+            }
+            HitTarget::ToggleDownloads => {
+                self.composer_menu = None;
+                self.modal = if self.modal == Modal::Downloads {
+                    Modal::None
+                } else {
+                    Modal::Downloads
+                };
+            }
+            HitTarget::PauseDownload => self.control_download(DownloadCommand::Pause),
+            HitTarget::CancelDownload => self.control_download(DownloadCommand::Cancel),
+            HitTarget::ResumeDownload => {
+                if let Some(job) = self.download.as_ref().filter(|job| {
+                    matches!(job.state, DownloadState::Paused | DownloadState::Failed(_))
+                }) {
+                    self.start_local_install(job.target.clone());
+                }
+            }
+            HitTarget::CycleLanguage | HitTarget::SetLanguage(_) => {
+                if let HitTarget::SetLanguage(code) = target {
+                    self.config.language = code.into();
+                    self.composer_menu = None;
+                } else {
+                    self.config.cycle_language();
+                }
                 self.config.save(&self.paths);
-                self.status_toast = Some(format!("Language: {}", self.config.language));
+                self.status_toast = Some(format!(
+                    "Language · {}",
+                    DictateConfig::language_label(&self.config.language)
+                ));
             }
             HitTarget::CycleHotkeyMode => {
                 self.config.hotkey_mode = self.config.hotkey_mode.next();
@@ -768,19 +1228,13 @@ impl DictateDesktopApp {
             HitTarget::RefreshMicrophones => {
                 self.available_mics = list_input_devices();
                 if self.available_mics.is_empty() {
-                    self.active_mic_name = "No microphone detected".to_string();
                     self.status_toast = Some(
                         "No microphone found — check Windows Microphone privacy settings"
                             .to_string(),
                     );
                 } else {
-                    if self.config.audio_device.is_none() {
-                        self.active_mic_name = self.available_mics[0].clone();
-                    }
-                    self.status_toast = Some(format!(
-                        "Found {} microphone(s)",
-                        self.available_mics.len()
-                    ));
+                    self.status_toast =
+                        Some(format!("Found {} microphone(s)", self.available_mics.len()));
                 }
             }
             HitTarget::CycleMicrophone => {
@@ -788,17 +1242,18 @@ impl DictateDesktopApp {
                     self.available_mics = list_input_devices();
                 }
                 if !self.available_mics.is_empty() {
-                    let cur = self
-                        .available_mics
-                        .iter()
-                        .position(|m| m == &self.active_mic_name)
-                        .unwrap_or(0);
-                    let next = (cur + 1) % self.available_mics.len();
-                    let chosen = self.available_mics[next].clone();
-                    self.active_mic_name = chosen.clone();
-                    self.config.audio_device = Some(chosen.clone());
+                    let current = self.config.audio_device.as_ref().and_then(|device| {
+                        self.available_mics.iter().position(|mic| mic == device)
+                    });
+                    let next = current.map_or(0, |index| index + 1);
+                    self.config.audio_device = self.available_mics.get(next).cloned();
                     self.config.save(&self.paths);
-                    self.status_toast = Some(format!("Microphone: {chosen}"));
+                    let chosen = self
+                        .config
+                        .audio_device
+                        .as_deref()
+                        .unwrap_or("System default");
+                    self.status_toast = Some(format!("Microphone · {chosen}"));
                 } else {
                     self.status_toast = Some("No microphones detected".to_string());
                 }
@@ -807,8 +1262,13 @@ impl DictateDesktopApp {
                 self.config.vad_auto_stop = !self.config.vad_auto_stop;
                 self.config.save(&self.paths);
             }
-            HitTarget::CycleDelivery => {
-                self.config.delivery_mode = self.config.delivery_mode.next();
+            HitTarget::CycleDelivery | HitTarget::SetDelivery(_) => {
+                self.config.delivery_mode = if let HitTarget::SetDelivery(mode) = target {
+                    self.composer_menu = None;
+                    mode
+                } else {
+                    self.config.delivery_mode.next()
+                };
                 self.config.save(&self.paths);
                 self.status_toast = Some(self.config.delivery_mode.label().to_string());
             }
@@ -820,7 +1280,7 @@ impl DictateDesktopApp {
                 };
                 self.config.save(&self.paths);
             }
-            HitTarget::OpenProviderConfig(pid) => self.open_provider_config_modal(pid),
+            HitTarget::OpenProviderConfig(pid) => self.open_provider_config_modal(pid, None),
             HitTarget::FocusProviderField(field) => {
                 if let Modal::ProviderConfig { active_field, .. } = &mut self.modal {
                     *active_field = field;
@@ -874,37 +1334,38 @@ impl DictateDesktopApp {
                 self.config.backend = "local".to_string();
                 self.config.local_model = model_id.clone();
                 self.config.save(&self.paths);
-                stop_whisper_server();
                 self.status_toast = Some(format!("Switched to local model: {model_id}"));
             }
-            HitTarget::SelectHistory(idx) => {
-                if idx < self.history.len() {
+            HitTarget::OpenHistory(id) => {
+                if let Some(idx) = self.history.iter().position(|entry| entry.id == id) {
                     self.selected_history = idx;
+                    self.modal = Modal::Transcript {
+                        id,
+                        scroll: 0,
+                        copied: false,
+                    };
                 }
             }
-            HitTarget::CopyHistory(idx) => {
-                if let Some(entry) = self.history.get(idx) {
+            HitTarget::CopyHistory(id) => {
+                if let Some(idx) = self.history.iter().position(|entry| entry.id == id) {
                     self.selected_history = idx;
-                    match copy_to_clipboard(&entry.text) {
-                        Ok(()) => self.status_toast = Some("Copied to clipboard".to_string()),
-                        Err(e) => self.status_toast = Some(format!("Clipboard error: {e}")),
+                    let result = copy_to_clipboard(&self.history[idx].text);
+                    if let Modal::Transcript { copied, .. } = &mut self.modal {
+                        *copied = result.is_ok();
+                        if result.is_err() {
+                            self.modal = Modal::None;
+                        }
                     }
+                    self.status_toast = Some(
+                        result
+                            .map_or_else(|err| err.to_string(), |()| "Copied to clipboard".into()),
+                    );
                 }
             }
-            HitTarget::TypeHistory(idx) => {
-                if let Some(entry) = self.history.get(idx) {
-                    self.selected_history = idx;
-                    let _ = copy_to_clipboard(&entry.text);
-                    match type_unicode_text(&entry.text) {
-                        Ok(()) => self.status_toast = Some("Typed into active window".to_string()),
-                        Err(e) => self.status_toast = Some(format!("Type error: {e}")),
-                    }
-                }
-            }
-            HitTarget::RequestDeleteHistory(idx) => {
-                if let Some(entry) = self.history.get(idx) {
+            HitTarget::RequestDeleteHistory(id) => {
+                if let Some(entry) = self.history.iter().find(|entry| entry.id == id) {
                     let preview = entry.text.trim().to_string();
-                    self.modal = Modal::ConfirmDeleteClip { index: idx, preview };
+                    self.modal = Modal::ConfirmDeleteClip { id, preview };
                 }
             }
             HitTarget::SaveProviderConfig => {
@@ -914,43 +1375,55 @@ impl DictateDesktopApp {
                     base_url,
                     model_id,
                     api_key,
+                    select_model,
                     ..
                 } = &self.modal
                 {
                     let pid = provider_id.clone();
                     let pname = provider_name.clone();
+                    if let Some(selected) = select_model {
+                        self.config.backend = pid.clone();
+                        self.config.commercial_model = selected.clone();
+                        self.view = AppView::Dictate;
+                    }
                     self.config.set_provider_config(
                         &pid,
                         api_key.clone(),
                         base_url.clone(),
                         model_id.clone(),
                     );
+                    self.model_choices = None;
                     self.config.save(&self.paths);
                     self.status_toast = Some(format!("Saved {pname} configuration"));
                     self.modal = Modal::None;
                 }
             }
-            HitTarget::ConfirmDownloadModel => {
-                if let Modal::ConfirmDownload { model_id, .. } = &self.modal {
-                    let mid = model_id.clone();
-                    self.modal = Modal::None;
-                    self.config.backend = "local".to_string();
-                    self.config.local_model = mid.clone();
-                    self.config.save(&self.paths);
-                    stop_whisper_server();
-                    self.view = AppView::Dictate;
-                    self.start_local_install(mid);
+            HitTarget::ConfirmInstall => {
+                if let Modal::ConfirmDownload(target) = &self.modal {
+                    let target = target.clone();
+                    if self.download_is_pending() {
+                        self.modal = Modal::Downloads;
+                    } else {
+                        self.modal = Modal::None;
+                        self.start_local_install(target);
+                    }
                 }
             }
             HitTarget::ConfirmDeleteClip => {
-                if let Modal::ConfirmDeleteClip { index, .. } = &self.modal {
-                    let idx = *index;
-                    if idx < self.history.len() {
+                if let Modal::ConfirmDeleteClip { id, .. } = &self.modal {
+                    if let Some(idx) = self.history.iter().position(|entry| &entry.id == id) {
                         self.history.remove(idx);
+                        self.main_text.clear_layouts();
+                        if idx < self.selected_history {
+                            self.selected_history -= 1;
+                        }
                         if self.selected_history >= self.history.len() && self.selected_history > 0
                         {
                             self.selected_history -= 1;
                         }
+                        self.history_scroll = self
+                            .history_scroll
+                            .min(self.history.len().saturating_sub(1));
                         save_history(&self.paths, &self.history);
                         self.status_toast = Some("Deleted clip".to_string());
                     }
@@ -960,46 +1433,43 @@ impl DictateDesktopApp {
             HitTarget::CloseModal => {
                 self.modal = Modal::None;
             }
+            HitTarget::KeepModalOpen => {}
         }
         self.request_redraws();
     }
 
-    fn process_background_events(&mut self) -> bool {
+    fn process_background_events(&mut self, sample_audio: bool) -> bool {
         let mut changed = false;
+        if self
+            .overlay_hide_at
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.set_overlay_visible(false);
+            changed = true;
+        }
 
         let mut vad_auto_triggered = false;
-        let mut realtime_clause = None;
-        if let Some(rec) = self.active_recording.as_ref() {
-            self.elapsed_secs = rec.elapsed_secs();
-            let (levels, hist, speaking) = rec.snapshot_waveform();
-            self.audio_levels = levels;
-            self.history_bars = hist;
-            self.vad_speaking = speaking;
-            if let Some(clause) = rec.take_completed_clause() {
-                realtime_clause = Some(clause);
+        if sample_audio {
+            if let Some(rec) = self.active_recording.as_ref() {
+                let (elapsed, levels, speaking) = rec.snapshot_waveform(&mut self.history_bars);
+                self.elapsed_secs = elapsed;
+                self.audio_levels = levels;
+                self.vad_speaking = speaking;
+                if let Some(session) = &mut self.session {
+                    while let Some(clause) = rec.take_completed_clause() {
+                        session.queue.push_back((clause, true));
+                    }
+                }
+                vad_auto_triggered = rec.should_stop.load(Ordering::Relaxed);
             }
-            if rec.should_stop.load(Ordering::Relaxed) {
-                vad_auto_triggered = true;
-            }
-            changed = true;
-        } else {
+        }
+        if self.active_recording.is_none() {
             self.audio_levels = [0.0; 15];
             self.vad_speaking = false;
             self.elapsed_secs = 0;
-            if matches!(self.phase, DictationPhase::Transcribing) {
-                changed = true;
-            }
         }
 
-        if let Some(clause) = realtime_clause {
-            self.dispatch_transcription(
-                clause.wav_bytes,
-                clause.duration_secs,
-                true,
-                self.target_hwnd,
-            );
-            changed = true;
-        }
+        self.dispatch_next_transcription();
 
         if vad_auto_triggered {
             self.stop_capture_and_transcribe();
@@ -1018,7 +1488,7 @@ impl DictateDesktopApp {
                     }
                 }
                 TrayEvent::ToggleDictation => {
-                    self.toggle_recording(None, true);
+                    self.toggle_recording(CaptureSource::Tray);
                 }
                 TrayEvent::Quit => {
                     self.should_exit = true;
@@ -1030,23 +1500,15 @@ impl DictateDesktopApp {
             changed = true;
             match ev {
                 GlobalHotkeyEvent::Pressed { target_hwnd } => {
-                    if self.active_recording.is_some() {
-                        self.stop_capture_and_transcribe();
-                    } else {
-                        self.start_capture(Some(target_hwnd), true);
-                    }
+                    self.toggle_recording(CaptureSource::Hotkey(target_hwnd));
                 }
                 GlobalHotkeyEvent::Released { held_ms } => {
-                    if self.active_recording.is_some() {
-                        match self.config.hotkey_mode {
-                            HotkeyMode::HoldToTalk => self.stop_capture_and_transcribe(),
-                            HotkeyMode::SmartHoldOrTap => {
-                                if held_ms >= 350 {
-                                    self.stop_capture_and_transcribe();
-                                }
-                            }
-                            HotkeyMode::RealTimeStreaming => {}
-                        }
+                    if self.session.as_ref().is_some_and(|session| {
+                        session
+                            .source
+                            .release_stops(session.config.hotkey_mode, held_ms)
+                    }) {
+                        self.stop_capture_and_transcribe();
                     }
                 }
             }
@@ -1055,45 +1517,88 @@ impl DictateDesktopApp {
         while let Ok(msg) = self.worker_rx.try_recv() {
             changed = true;
             match msg {
-                WorkerMessage::InstallProgress { label, progress } => {
-                    self.phase = DictationPhase::Installing { label, progress };
+                WorkerMessage::InstallProgress(status) => {
+                    if let Some(job) = &mut self.download {
+                        job.state = DownloadState::Running(status);
+                        if let Some(progress) = status.transfer() {
+                            job.progress = Some(progress);
+                        }
+                    }
                 }
-                WorkerMessage::InstallDone(Ok(model_id)) => {
-                    self.phase = DictationPhase::Idle;
-                    self.set_overlay_visible(false);
-                    self.status_toast = Some(format!("Installed {model_id}"));
-                }
-                WorkerMessage::InstallDone(Err(err)) => {
-                    self.phase = DictationPhase::Error(err.clone());
-                    self.set_overlay_visible(false);
-                    self.status_toast = Some(format!("Setup failed: {err}"));
+                WorkerMessage::InstallDone {
+                    target,
+                    result,
+                    previous_selection,
+                } => {
+                    self.download_command = None;
+                    self.refresh_inventory();
+                    let Some(job) = &mut self.download else {
+                        continue;
+                    };
+                    job.stopping = false;
+                    job.state = match result {
+                        Ok(DownloadOutcome::Complete) => {
+                            let (backend, local_model, commercial_model) = previous_selection;
+                            if let InstallTarget::Model(model_id) = &target {
+                                if self.config.backend == backend
+                                    && self.config.local_model == local_model
+                                    && self.config.commercial_model == commercial_model
+                                {
+                                    self.config.backend = "local".into();
+                                    self.config.local_model = model_id.clone();
+                                    self.config.save(&self.paths);
+                                }
+                            }
+                            self.recent_downloads.retain(|previous| previous != &target);
+                            self.recent_downloads.insert(0, target);
+                            self.recent_downloads.truncate(3);
+                            DownloadState::Completed
+                        }
+                        Ok(DownloadOutcome::Paused) => DownloadState::Paused,
+                        Ok(DownloadOutcome::Canceled) => {
+                            job.progress = None;
+                            DownloadState::Canceled
+                        }
+                        Err(err) => DownloadState::Failed(err),
+                    };
                 }
                 WorkerMessage::TranscriptionDone {
+                    session_id,
                     duration_secs,
                     is_realtime_clause,
-                    target_hwnd,
                     result,
-                } => match result {
-                    Ok(out) => {
-                        if !is_realtime_clause {
-                            self.phase = DictationPhase::Idle;
-                            self.set_overlay_visible(false);
-                        }
-                        if !out.text.trim().is_empty() {
-                            let to_inject = if is_realtime_clause {
-                                format!("{} ", out.text.trim())
-                            } else {
-                                out.text.clone()
+                } => {
+                    self.pending_transcription = None;
+                    let Some(session) = self
+                        .session
+                        .as_mut()
+                        .filter(|session| session.id == session_id)
+                    else {
+                        self.dispatch_next_transcription();
+                        continue;
+                    };
+                    match result {
+                        Ok(out) if !out.text.trim().is_empty() => {
+                            let target_hwnd = match session.source {
+                                CaptureSource::Hotkey(hwnd)
+                                    if hwnd != 0
+                                        && !self
+                                            .main_window
+                                            .as_ref()
+                                            .is_some_and(|win| is_native_window(win, hwnd)) =>
+                                {
+                                    Some(hwnd)
+                                }
+                                _ => None,
                             };
-                            self.live_preview = out.text.clone();
-                            let delivery_note = match deliver_transcript(
-                                &to_inject,
-                                self.config.delivery_mode,
+                            let delivery_note = deliver_transcript(
+                                &out.text,
+                                session.config.delivery_mode,
                                 target_hwnd,
-                            ) {
-                                Ok(note) => note,
-                                Err(e) => format!("Copied to clipboard ({e})"),
-                            };
+                                is_realtime_clause,
+                            )
+                            .unwrap_or_else(|err| format!("Saved to history. {err}"));
+                            self.live_preview = out.text.clone();
                             let entry = HistoryEntry {
                                 id: uuid::Uuid::new_v4().to_string(),
                                 text: out.text,
@@ -1104,26 +1609,24 @@ impl DictateDesktopApp {
                                 elapsed_ms: out.elapsed_ms,
                             };
                             self.history.insert(0, entry);
-                            self.selected_history = 0;
-                            self.history_scroll = 0;
+                            if self.history_scroll > 0 || self.modal != Modal::None {
+                                self.selected_history =
+                                    (self.selected_history + 1).min(self.history.len() - 1);
+                                if self.history_scroll > 0 {
+                                    self.history_scroll += 1;
+                                }
+                            } else {
+                                self.selected_history = 0;
+                            }
                             save_history(&self.paths, &self.history);
-                            self.status_toast =
-                                Some(format!("{delivery_note} ({}ms)", out.elapsed_ms));
-                        } else if !is_realtime_clause {
-                            self.status_toast = Some(
-                                "No speech detected — check Microphone level in Settings"
-                                    .to_string(),
-                            );
+                            self.status_toast = Some(delivery_note);
                         }
+                        Ok(_) => {}
+                        Err(err) => session.error = Some(err),
                     }
-                    Err(err) => {
-                        self.phase = DictationPhase::Error(err.clone());
-                        if !is_realtime_clause {
-                            self.set_overlay_visible(false);
-                        }
-                        self.status_toast = Some(err);
-                    }
-                },
+                    self.dispatch_next_transcription();
+                    self.finish_session_if_drained();
+                }
             }
         }
 
@@ -1138,7 +1641,7 @@ impl ApplicationHandler for DictateDesktopApp {
         }
         // 1. Custom Frameless Main Application Window
         let main_attrs = Window::default_attributes()
-            .with_title("Enio")
+            .with_title(APP_NAME)
             .with_decorations(false)
             .with_window_icon(create_winit_window_icon())
             .with_inner_size(LogicalSize::new(980.0, 640.0))
@@ -1157,7 +1660,7 @@ impl ApplicationHandler for DictateDesktopApp {
         let overlay_w = 420.0_f64;
         let overlay_h = 74.0_f64;
         let mut ov_attrs = Window::default_attributes()
-            .with_title("Enio Overlay")
+            .with_title(format!("{APP_NAME} Overlay"))
             .with_decorations(false)
             .with_transparent(true)
             .with_resizable(false)
@@ -1183,40 +1686,64 @@ impl ApplicationHandler for DictateDesktopApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.process_background_events() {
-            self.request_redraws();
-        }
+        let now = Instant::now();
+        let frame_due = now >= self.next_frame_at;
+        let mut redraw = self.process_background_events(frame_due);
         if self.should_exit {
             event_loop.exit();
             return;
         }
-        let hover_animating =
-            self.last_hovered.is_some() && self.hover_started_at.elapsed() < Duration::from_millis(120);
-        if hover_animating {
-            self.request_redraws();
+        let main_visible = self
+            .main_window
+            .as_ref()
+            .is_some_and(|win| win.is_visible() != Some(false) && win.is_minimized() != Some(true));
+        let visual_animating = main_visible
+            && self.transitions.enabled
+            && (self.transitions.animating(now)
+                || (self.last_hovered.is_some()
+                    && self.hover_started_at.elapsed()
+                        < Duration::from_millis(icon_motion::HOVER_MS))
+                || (self.leaving_hover.is_some()
+                    && self.hover_started_at.elapsed() < Duration::from_millis(125))
+                || self.download.as_ref().is_some_and(DownloadJob::is_running));
+        let needs_frames = self.active_recording.is_some()
+            || visual_animating
+            || (self.overlay_visible && self.phase == DictationPhase::Transcribing);
+        let mut deadline = self.overlay_hide_at;
+        if needs_frames {
+            if frame_due {
+                let next = self.next_frame_at + FRAME_INTERVAL;
+                self.next_frame_at = if next > now {
+                    next
+                } else {
+                    now + FRAME_INTERVAL
+                };
+                redraw = true;
+            }
+            deadline = Some(deadline.map_or(self.next_frame_at, |at| at.min(self.next_frame_at)));
         }
-        if (self.view == AppView::Models && self.model_search_focused)
-            || matches!(self.modal, Modal::ProviderConfig { .. })
+        if main_visible
+            && ((self.view == AppView::Models && self.model_search_focused)
+                || matches!(self.modal, Modal::ProviderConfig { .. }))
         {
-            let caret_on = (self.caret_blink_at.elapsed().as_millis() / 530) % 2 == 0;
+            let elapsed_ms = now
+                .saturating_duration_since(self.caret_blink_at)
+                .as_millis();
+            let caret_on = (elapsed_ms / CARET_INTERVAL_MS) % 2 == 0;
             if caret_on != self.last_caret_on {
                 self.last_caret_on = caret_on;
-                self.request_redraws();
+                redraw = true;
             }
+            let blink_at = now
+                + Duration::from_millis(
+                    (CARET_INTERVAL_MS - elapsed_ms % CARET_INTERVAL_MS) as u64,
+                );
+            deadline = Some(deadline.map_or(blink_at, |at| at.min(blink_at)));
         }
-        let poll_ms = if self.active_recording.is_some()
-            || hover_animating
-            || matches!(
-                self.phase,
-                DictationPhase::Transcribing | DictationPhase::Installing { .. }
-            ) {
-            16 // 60 fps live waveform & hover ease-out
-        } else {
-            50
-        };
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + Duration::from_millis(poll_ms),
-        ));
+        if redraw {
+            self.request_redraws();
+        }
+        event_loop.set_control_flow(deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
     }
 
     fn window_event(
@@ -1244,6 +1771,8 @@ impl ApplicationHandler for DictateDesktopApp {
                 } => {
                     if self.active_recording.is_some() {
                         self.stop_capture_and_transcribe();
+                    } else if self.overlay_hide_at.is_some() {
+                        self.set_overlay_visible(false);
                     }
                 }
                 WindowEvent::RedrawRequested => {
@@ -1270,11 +1799,17 @@ impl ApplicationHandler for DictateDesktopApp {
                                 &mut self.overlay_text,
                                 logical_w,
                                 logical_h,
-                                &self.config,
+                                self.session
+                                    .as_ref()
+                                    .map_or(&self.config, |session| &session.config),
+                                self.session.as_ref().is_some_and(|session| {
+                                    matches!(session.source, CaptureSource::Hotkey(_))
+                                }),
                                 &self.phase,
                                 self.elapsed_secs,
                                 self.audio_levels,
                                 &self.live_preview,
+                                self.status_toast.as_deref(),
                             );
                             let _ = r.render(
                                 ctx,
@@ -1314,6 +1849,16 @@ impl ApplicationHandler for DictateDesktopApp {
             }
             WindowEvent::ModifiersChanged(mods) => {
                 self.modifiers = mods.state();
+            }
+            WindowEvent::Focused(focused) => {
+                if focused {
+                    self.refresh_inventory();
+                }
+                self.request_redraws();
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.mouse_pos = (-1.0, -1.0);
+                self.update_hover(None);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 let lx = position.x as f32 / scale;
@@ -1363,12 +1908,7 @@ impl ApplicationHandler for DictateDesktopApp {
                     }
                 }
 
-                // Only repaint when hover target actually changes (zero wasted redraws)
-                if hovered != self.last_hovered {
-                    self.last_hovered = hovered;
-                    self.hover_started_at = Instant::now();
-                    self.request_redraws();
-                }
+                self.update_hover(hovered);
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
@@ -1483,15 +2023,20 @@ impl ApplicationHandler for DictateDesktopApp {
                     }
                 };
                 if step != 0 {
+                    if !matches!(self.modal, Modal::None) {
+                        self.scroll_transcript(step * 3);
+                        return;
+                    }
+                    if self.composer_menu.is_some() {
+                        return;
+                    }
                     match self.view {
                         AppView::Models => {
-                            let total = filtered_stt_choices(
-                                &self.paths,
-                                &self.config,
-                                self.model_tab,
-                                &self.model_filter,
-                            )
-                            .len();
+                            self.sync_model_choices();
+                            let total = self
+                                .model_choices
+                                .as_ref()
+                                .map_or(0, |cache| cache.rows.len());
                             let visible = self
                                 .hits
                                 .iter()
@@ -1532,7 +2077,13 @@ impl ApplicationHandler for DictateDesktopApp {
                                     as usize;
                             }
                         }
-                        AppView::Settings => {}
+                        AppView::Settings => {
+                            let limit = Self::scroll_limit(&self.hits, ScrollList::Settings);
+                            self.settings_scroll = self
+                                .settings_scroll
+                                .saturating_add_signed(step * 44)
+                                .min(limit);
+                        }
                     }
                     self.request_redraws();
                 }
@@ -1544,6 +2095,15 @@ impl ApplicationHandler for DictateDesktopApp {
                 let ctrl = self.modifiers.control_key();
 
                 if ctrl
+                    && !event.repeat
+                    && matches!(self.modal, Modal::None | Modal::Downloads)
+                    && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("j"))
+                {
+                    self.execute_hit(event_loop, HitTarget::ToggleDownloads);
+                    return;
+                }
+
+                if ctrl
                     && matches!(&event.logical_key, Key::Character(c) if c.eq_ignore_ascii_case("t"))
                 {
                     self.execute_hit(event_loop, HitTarget::ToggleTheme);
@@ -1553,11 +2113,34 @@ impl ApplicationHandler for DictateDesktopApp {
                 // Active modal keyboard handling (Provider Config, Confirm Download, Confirm Delete)
                 match &mut self.modal {
                     Modal::None => {}
-                    Modal::ConfirmDownload { .. } => {
+                    Modal::Downloads => {
+                        if event.logical_key == Key::Named(NamedKey::Escape) {
+                            self.modal = Modal::None;
+                            self.request_redraws();
+                        }
+                        return;
+                    }
+                    Modal::Transcript { id, .. } => {
                         match &event.logical_key {
                             Key::Named(NamedKey::Escape) => self.modal = Modal::None,
                             Key::Named(NamedKey::Enter) => {
-                                self.execute_hit(event_loop, HitTarget::ConfirmDownloadModel);
+                                let id = id.clone();
+                                self.execute_hit(event_loop, HitTarget::CopyHistory(id));
+                            }
+                            Key::Named(NamedKey::ArrowUp) => self.scroll_transcript(-1),
+                            Key::Named(NamedKey::ArrowDown) => self.scroll_transcript(1),
+                            Key::Named(NamedKey::PageUp) => self.scroll_transcript(-10),
+                            Key::Named(NamedKey::PageDown) => self.scroll_transcript(10),
+                            _ => {}
+                        }
+                        self.request_redraws();
+                        return;
+                    }
+                    Modal::ConfirmDownload(_) => {
+                        match &event.logical_key {
+                            Key::Named(NamedKey::Escape) => self.modal = Modal::None,
+                            Key::Named(NamedKey::Enter) => {
+                                self.execute_hit(event_loop, HitTarget::ConfirmInstall);
                                 return;
                             }
                             _ => {}
@@ -1666,13 +2249,11 @@ impl ApplicationHandler for DictateDesktopApp {
 
                 // Models page live search & navigation
                 if self.view == AppView::Models {
-                    let choices = filtered_stt_choices(
-                        &self.paths,
-                        &self.config,
-                        self.model_tab,
-                        &self.model_filter,
-                    );
-                    let total = choices.len();
+                    self.sync_model_choices();
+                    let total = self
+                        .model_choices
+                        .as_ref()
+                        .map_or(0, |cache| cache.rows.len());
                     match &event.logical_key {
                         Key::Named(NamedKey::Escape) => {
                             if !self.model_filter.is_empty() {
@@ -1757,18 +2338,26 @@ impl ApplicationHandler for DictateDesktopApp {
                     return;
                 }
 
+                if self.composer_menu.is_some() {
+                    if event.logical_key == Key::Named(NamedKey::Escape) {
+                        self.composer_menu = None;
+                        self.request_redraws();
+                    }
+                    return;
+                }
+
                 // Dictate & Settings shortcuts
                 match &event.logical_key {
-                    Key::Named(NamedKey::Space) => self.toggle_recording(None, false),
+                    Key::Named(NamedKey::Space)
+                        if self.view == AppView::Dictate
+                            && !event.repeat
+                            && self.modifiers.is_empty() =>
+                    {
+                        self.toggle_recording(CaptureSource::Window);
+                    }
                     Key::Named(NamedKey::Escape) => {
-                        if self.model_dropdown_open {
-                            self.model_dropdown_open = false;
-                            self.request_redraws();
-                        } else if let Some(rec) = self.active_recording.take() {
-                            drop(rec);
-                            self.phase = DictationPhase::Idle;
-                            self.set_overlay_visible(false);
-                            self.request_redraws();
+                        if self.session.is_some() {
+                            self.cancel_recording();
                         } else if self.view != AppView::Dictate {
                             self.view = AppView::Dictate;
                             self.request_redraws();
@@ -1786,20 +2375,30 @@ impl ApplicationHandler for DictateDesktopApp {
                     Key::Named(NamedKey::ArrowDown) if self.view == AppView::Dictate => {
                         if self.selected_history + 1 < self.history.len() {
                             self.selected_history += 1;
-                            if self.selected_history >= self.history_scroll + 4 {
-                                self.history_scroll = self.selected_history.saturating_sub(3);
+                            let id = &self.history[self.selected_history].id;
+                            if !self.hits.iter().any(|zone| matches!(&zone.target, HitTarget::OpenHistory(visible) if visible == id)) {
+                                self.history_scroll = self.selected_history;
                             }
                             self.request_redraws();
                         }
                     }
                     Key::Named(NamedKey::Enter) if self.view == AppView::Dictate => {
-                        self.execute_hit(event_loop, HitTarget::CopyHistory(self.selected_history));
+                        if let Some(entry) = self.history.get(self.selected_history) {
+                            let target = if ctrl {
+                                HitTarget::CopyHistory(entry.id.clone())
+                            } else {
+                                HitTarget::OpenHistory(entry.id.clone())
+                            };
+                            self.execute_hit(event_loop, target);
+                        }
                     }
                     _ => {}
                 }
             }
             WindowEvent::RedrawRequested => {
-                self.process_background_events();
+                if self.view == AppView::Models {
+                    self.sync_model_choices();
+                }
                 if let (Some(ctx), Some(win), Some(renderer)) = (
                     &self.gpu_ctx,
                     &self.main_window,
@@ -1807,44 +2406,131 @@ impl ApplicationHandler for DictateDesktopApp {
                 ) {
                     let s = win.scale_factor() as f32;
                     let size = win.inner_size();
+                    if size.width == 0 || size.height == 0 {
+                        return;
+                    }
                     let logical_w = size.width as f32 / s;
                     let logical_h = size.height as f32 / s;
 
-                    let raw_t = (self.hover_started_at.elapsed().as_secs_f32() / 0.11).clamp(0.0, 1.0);
-                    let hover_t = 1.0 - (1.0 - raw_t).powi(3); // cubic ease-out
+                    let hover_t = if self.transitions.enabled {
+                        hover_progress(self.hover_started_at.elapsed())
+                    } else {
+                        1.0
+                    };
+                    let now = Instant::now();
+                    self.transitions.page.update(self.view, now);
+                    self.transitions.popup.update(self.composer_menu, now);
+                    self.transitions
+                        .modal
+                        .update(std::mem::discriminant(&self.modal), now);
+                    let setup_visible = self.download.as_ref().is_some_and(|job| {
+                        job.target.model_id() == Some(self.config.local_model.as_str())
+                            && !matches!(
+                                job.state,
+                                DownloadState::Completed | DownloadState::Canceled
+                            )
+                    });
+                    self.transitions
+                        .dictation
+                        .update((std::mem::discriminant(&self.phase), setup_visible), now);
+                    let download_fraction = self.transitions.update_download(
+                        self.download
+                            .as_ref()
+                            .and_then(|job| job.progress)
+                            .and_then(|progress| progress.fraction()),
+                        now,
+                    );
 
                     self.main_draw.clear(s);
                     let snap = UiSnapshot {
                         width: logical_w,
                         height: logical_h,
+                        window_border: (!win.is_maximized() && win.fullscreen().is_none())
+                            .then(|| window_border_color(win.has_focus())),
                         view: self.view,
                         model_tab: self.model_tab,
                         model_filter: &self.model_filter,
                         model_search_focused: self.model_search_focused,
-                        model_dropdown_open: self.model_dropdown_open,
+                        composer_menu: self.composer_menu,
                         caret_visible: self.last_caret_on,
                         model_selected: self.model_selected,
                         model_scroll: self.model_scroll,
+                        settings_scroll: self.settings_scroll,
                         config: &self.config,
-                        paths: &self.paths,
+                        inventory: &self.inventory,
+                        model_choices: self
+                            .model_choices
+                            .as_ref()
+                            .map_or(&[], |cache| cache.rows.as_slice()),
                         phase: &self.phase,
+                        download: self.download.as_ref(),
+                        recent_downloads: &self.recent_downloads,
+                        download_fraction,
+                        page_t: if self.transitions.enabled {
+                            self.transitions.page.value(now, 180.0)
+                        } else {
+                            1.0
+                        },
+                        popup_t: if self.transitions.enabled {
+                            self.transitions.popup.value(now, 160.0)
+                        } else {
+                            1.0
+                        },
+                        modal_t: if self.transitions.enabled {
+                            self.transitions.modal.value(now, 220.0)
+                        } else {
+                            1.0
+                        },
+                        dictation_t: if self.transitions.enabled {
+                            self.transitions.dictation.value(now, 150.0)
+                        } else {
+                            1.0
+                        },
                         elapsed_secs: self.elapsed_secs,
                         history_bars: &self.history_bars,
                         vad_speaking: self.vad_speaking,
-                        live_preview: &self.live_preview,
                         history: &self.history,
                         selected_history: self.selected_history,
                         history_scroll: self.history_scroll,
                         status_toast: self.status_toast.as_deref(),
                         modal: &self.modal,
-                        active_mic_name: &self.active_mic_name,
+                        active_mic_name: if self.available_mics.is_empty() {
+                            "No microphone found"
+                        } else {
+                            self.config
+                                .audio_device
+                                .as_ref()
+                                .filter(|device| self.available_mics.contains(device))
+                                .map_or("System default", String::as_str)
+                        },
                         mouse_pos: self.mouse_pos,
                         hover_t,
+                        leaving_hover: self
+                            .leaving_hover
+                            .as_ref()
+                            .map(|(target, strength)| (target, *strength * (1.0 - hover_t))),
+                        icon_hover_ms: if self.transitions.enabled && self.last_hovered.is_some() {
+                            self.hover_started_at.elapsed().as_secs_f32() * 1000.0
+                        } else {
+                            f32::INFINITY
+                        },
+                        spinner_angle: if self.transitions.enabled {
+                            self.transitions.clock.elapsed().subsec_nanos() as f32 * 0.000_000_36
+                        } else {
+                            0.0
+                        },
                         pressed_target: self.pressed_target.as_ref(),
                         dragging_scrollbar: self.dragging_scrollbar.map(|(l, ..)| l),
                     };
                     self.hits =
                         render_main_window(&mut self.main_draw, &mut self.main_text, &snap);
+                    if self.view == AppView::Settings && self.modal == Modal::None {
+                        let limit = Self::scroll_limit(&self.hits, ScrollList::Settings);
+                        if self.settings_scroll > limit {
+                            self.settings_scroll = limit;
+                            win.request_redraw();
+                        }
+                    }
                     let _ = renderer.render(
                         ctx,
                         palette().bg,

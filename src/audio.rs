@@ -6,10 +6,11 @@
 //!   are connected, and full support for USB/Bluetooth/virtual/Realtek microphones.
 //! - On Linux/macOS: uses `cpal`.
 
-use crate::vad::{compute_rms, voice_like_spectrum, VadEvent, VoiceActivity, WaveformState};
+use crate::vad::{compute_rms, VadEvent, VoiceActivity, VoiceSpectrum, WaveformState};
 use crate::wav::{encode_wav_pcm16, WHISPER_SAMPLE_RATE};
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::JoinHandle;
@@ -23,8 +24,10 @@ const MIN_CLAUSE_SAMPLES: usize = 7_200;
 pub struct SharedAudioCapture {
     pub samples_16k: Vec<f32>,
     pub clause_start_idx: usize,
+    completed_clause_ends: VecDeque<usize>,
     pub waveform: WaveformState,
     pub vad: VoiceActivity,
+    spectrum: VoiceSpectrum,
     pub started_at: Instant,
     pub vad_auto_stop: bool,
     pub realtime_stream: bool,
@@ -39,16 +42,12 @@ pub struct ActiveRecording {
     worker: Option<JoinHandle<()>>,
     pub shared: Arc<Mutex<SharedAudioCapture>>,
     pub should_stop: Arc<AtomicBool>,
-    pub clause_ready: Arc<AtomicBool>,
     pub device_name: String,
 }
 
 impl Drop for ActiveRecording {
     fn drop(&mut self) {
-        self.stop_signal.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.worker.take() {
-            let _ = handle.join();
-        }
+        self.stop_capture();
     }
 }
 
@@ -61,20 +60,21 @@ fn feed_16k_mono_chunk(
     mono_16k: &[f32],
     shared: &Arc<Mutex<SharedAudioCapture>>,
     should_stop: &Arc<AtomicBool>,
-    clause_ready: &Arc<AtomicBool>,
 ) {
     if mono_16k.is_empty() || should_stop.load(Ordering::Relaxed) {
         return;
     }
     let rms = compute_rms(mono_16k);
-    let mut guard = shared.lock();
+    let guard = &mut *shared.lock();
     let elapsed_ms = guard.started_at.elapsed().as_millis() as u64;
     guard.chunks_received += 1;
     guard.peak_rms = guard.peak_rms.max(rms);
     guard.samples_16k.extend_from_slice(mono_16k);
     guard.waveform.push_rms(rms, elapsed_ms);
 
-    let voice_like = voice_like_spectrum(&guard.samples_16k, WHISPER_SAMPLE_RATE);
+    let voice_like = guard
+        .spectrum
+        .is_voice_like(&guard.samples_16k, WHISPER_SAMPLE_RATE);
     match guard.vad.sample(rms, elapsed_ms, voice_like) {
         Some(VadEvent::Start) => {
             guard.speech_detected = true;
@@ -82,12 +82,15 @@ fn feed_16k_mono_chunk(
         }
         Some(VadEvent::End) => {
             if guard.realtime_stream && guard.clause_has_speech {
-                let pending = guard
-                    .samples_16k
-                    .len()
-                    .saturating_sub(guard.clause_start_idx);
-                if pending >= MIN_CLAUSE_SAMPLES {
-                    clause_ready.store(true, Ordering::Relaxed);
+                let start = guard
+                    .completed_clause_ends
+                    .back()
+                    .copied()
+                    .unwrap_or(guard.clause_start_idx);
+                let end = guard.samples_16k.len();
+                if end - start >= MIN_CLAUSE_SAMPLES {
+                    guard.completed_clause_ends.push_back(end);
+                    guard.clause_has_speech = false;
                 }
             } else if guard.vad_auto_stop && guard.speech_detected {
                 should_stop.store(true, Ordering::Relaxed);
@@ -180,8 +183,10 @@ pub fn start_recording(
     let shared = Arc::new(Mutex::new(SharedAudioCapture {
         samples_16k: Vec::with_capacity(WHISPER_SAMPLE_RATE as usize * 15),
         clause_start_idx: 0,
+        completed_clause_ends: VecDeque::new(),
         waveform: WaveformState::default(),
         vad: VoiceActivity::default(),
+        spectrum: VoiceSpectrum::default(),
         started_at: Instant::now(),
         vad_auto_stop,
         realtime_stream,
@@ -191,13 +196,11 @@ pub fn start_recording(
         peak_rms: 0.0,
     }));
     let should_stop = Arc::new(AtomicBool::new(false));
-    let clause_ready = Arc::new(AtomicBool::new(false));
     let stop_signal = Arc::new(AtomicBool::new(false));
 
     let (init_tx, init_rx) = mpsc::channel::<Result<(), String>>();
     let shared_w = Arc::clone(&shared);
     let should_stop_w = Arc::clone(&should_stop);
-    let clause_ready_w = Arc::clone(&clause_ready);
     let stop_signal_w = Arc::clone(&stop_signal);
 
     let worker = std::thread::spawn(move || {
@@ -293,12 +296,7 @@ pub fn start_recording(
                         let sample = i16::from_le_bytes([pair[0], pair[1]]);
                         float_scratch.push(f32::from(sample) / 32768.0);
                     }
-                    feed_16k_mono_chunk(
-                        &float_scratch,
-                        &shared_w,
-                        &should_stop_w,
-                        &clause_ready_w,
-                    );
+                    feed_16k_mono_chunk(&float_scratch, &shared_w, &should_stop_w);
                     if !stop_signal_w.load(Ordering::Relaxed) {
                         unsafe {
                             std::ptr::addr_of_mut!((*hdr_ptr).dwFlags)
@@ -330,7 +328,6 @@ pub fn start_recording(
             worker: Some(worker),
             shared,
             should_stop,
-            clause_ready,
             device_name,
         }),
         Ok(Err(err)) => {
@@ -380,8 +377,10 @@ pub fn start_recording(
     let shared = Arc::new(Mutex::new(SharedAudioCapture {
         samples_16k: Vec::with_capacity(WHISPER_SAMPLE_RATE as usize * 15),
         clause_start_idx: 0,
+        completed_clause_ends: VecDeque::new(),
         waveform: WaveformState::default(),
         vad: VoiceActivity::default(),
+        spectrum: VoiceSpectrum::default(),
         started_at: Instant::now(),
         vad_auto_stop,
         realtime_stream,
@@ -391,13 +390,11 @@ pub fn start_recording(
         peak_rms: 0.0,
     }));
     let should_stop = Arc::new(AtomicBool::new(false));
-    let clause_ready = Arc::new(AtomicBool::new(false));
     let stop_signal = Arc::new(AtomicBool::new(false));
     let (init_tx, init_rx) = mpsc::channel::<Result<String, String>>();
 
     let shared_w = Arc::clone(&shared);
     let should_stop_w = Arc::clone(&should_stop);
-    let clause_ready_w = Arc::clone(&clause_ready);
     let stop_signal_w = Arc::clone(&stop_signal);
 
     let worker = std::thread::spawn(move || {
@@ -423,7 +420,7 @@ pub fn start_recording(
                     &cfg,
                     move |data: &[f32], _| {
                         let mono = resample_to_16k_mono(data, rate, ch);
-                        feed_16k_mono_chunk(&mono, &shared_w, &should_stop_w, &clause_ready_w);
+                        feed_16k_mono_chunk(&mono, &shared_w, &should_stop_w);
                     },
                     |_| {},
                     None,
@@ -454,7 +451,6 @@ pub fn start_recording(
             worker: Some(worker),
             shared,
             should_stop,
-            clause_ready,
             device_name,
         }),
         Ok(Err(e)) => {
@@ -469,52 +465,46 @@ pub fn start_recording(
 }
 
 impl ActiveRecording {
-    pub fn elapsed_secs(&self) -> u64 {
-        self.shared.lock().started_at.elapsed().as_secs()
-    }
-
     pub fn diag_stats(&self) -> (u64, usize, f32) {
         let guard = self.shared.lock();
         (guard.chunks_received, guard.samples_16k.len(), guard.peak_rms)
     }
 
-    pub fn snapshot_waveform(&self) -> ([f32; 15], Vec<f32>, bool) {
+    pub fn snapshot_waveform(&self, history: &mut Vec<f32>) -> (u64, [f32; 15], bool) {
         let mut guard = self.shared.lock();
-        let now_ms = guard.started_at.elapsed().as_millis() as u64;
-        guard.waveform.tick(now_ms);
+        let elapsed = guard.started_at.elapsed();
+        guard.waveform.tick(elapsed.as_millis() as u64);
+        history.clone_from(&guard.waveform.history);
         (
+            elapsed.as_secs(),
             guard.waveform.audio_levels,
-            guard.waveform.history.clone(),
             guard.vad.speaking,
         )
     }
 
     pub fn take_completed_clause(&self) -> Option<CompletedRecording> {
-        if !self.clause_ready.swap(false, Ordering::Relaxed) {
-            return None;
-        }
         let mut guard = self.shared.lock();
+        let end = guard.completed_clause_ends.pop_front()?;
         let start = guard.clause_start_idx;
-        let end = guard.samples_16k.len();
-        if end.saturating_sub(start) < MIN_CLAUSE_SAMPLES {
-            return None;
-        }
         let slice = &guard.samples_16k[start..end];
         let duration_secs = slice.len() as f32 / WHISPER_SAMPLE_RATE as f32;
         let wav_bytes = encode_wav_pcm16(slice, WHISPER_SAMPLE_RATE);
         guard.clause_start_idx = end;
-        guard.clause_has_speech = false;
         Some(CompletedRecording {
             wav_bytes,
             duration_secs,
         })
     }
 
-    pub fn finish(mut self) -> Option<CompletedRecording> {
+    pub fn stop_capture(&mut self) {
         self.stop_signal.store(true, Ordering::SeqCst);
         if let Some(handle) = self.worker.take() {
             let _ = handle.join();
         }
+    }
+
+    pub fn finish(mut self) -> Option<CompletedRecording> {
+        self.stop_capture();
         let guard = self.shared.lock();
         let elapsed_ms = guard.started_at.elapsed().as_millis() as u64;
         let start = if guard.realtime_stream {
@@ -522,7 +512,7 @@ impl ActiveRecording {
         } else {
             0
         };
-        let remaining = &guard.samples_16k[start.min(guard.samples_16k.len())..];
+        let remaining = &guard.samples_16k[start..];
         if elapsed_ms < MIN_RECORDING_MS || remaining.len() < 2000 {
             return None;
         }
@@ -532,5 +522,46 @@ impl ActiveRecording {
             wav_bytes,
             duration_secs,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queued_clauses_end_at_their_vad_boundaries() {
+        let recording = ActiveRecording {
+            stop_signal: Arc::new(AtomicBool::new(false)),
+            worker: None,
+            shared: Arc::new(Mutex::new(SharedAudioCapture {
+                samples_16k: vec![0.25; 17_600],
+                clause_start_idx: 0,
+                completed_clause_ends: VecDeque::from([7_200, 15_200]),
+                waveform: WaveformState::default(),
+                vad: VoiceActivity::default(),
+                spectrum: VoiceSpectrum::default(),
+                started_at: Instant::now() - Duration::from_secs(1),
+                vad_auto_stop: false,
+                realtime_stream: true,
+                speech_detected: true,
+                clause_has_speech: true,
+                chunks_received: 0,
+                peak_rms: 0.25,
+            })),
+            should_stop: Arc::new(AtomicBool::new(false)),
+            device_name: String::new(),
+        };
+
+        assert_eq!(
+            recording.take_completed_clause().unwrap().duration_secs,
+            0.45
+        );
+        assert_eq!(
+            recording.take_completed_clause().unwrap().duration_secs,
+            0.50
+        );
+        assert!(recording.take_completed_clause().is_none());
+        assert_eq!(recording.finish().unwrap().duration_secs, 0.15);
     }
 }
